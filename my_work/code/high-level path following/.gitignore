@@ -1,0 +1,37 @@
+# Local environments and caches
+/.venv/
+/.venv_py312_broken/
+/.matplotlib/
+/.pip_tmp/
+/.vscode/
+/.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+**/__pycache__/
+*.py[cod]
+*.log
+
+# Workspace metadata
+.obsidian/
+**/.obsidian/
+.obsidian.json
+*.canvas
+
+# Generated ML artifacts
+*.monitor.csv
+*.npz
+*.zip
+*.mp4
+events.out.tfevents.*
+
+# Generated experiment outputs
+/artifacts/
+/logs/
+/models/
+/tb_logs/
+/best_model/
+/experiments/unstructured_dqn/unstruc_kouyrani_dqn/runs/
+/experiments/unstructured_dqn/unstruc_kouyrani_dqn/hyp_2/runs/
+/experiments/unstructured_dqn/unstruc_kouyrani_dqn/tensorboard/
+/src/deep_learning/Elurant_PPO/reward_function_study/logs/
+/src/deep_learning/Elurant_PPO/reward_function_study/tb/
+/src/deep_learning/Elurant_PPO/reward_function_study/v/

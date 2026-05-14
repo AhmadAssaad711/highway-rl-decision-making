@@ -1,0 +1,11 @@
+gymnasium
+highway-env
+stable-baselines3[extra]
+torch
+numpy
+pandas
+matplotlib
+pygame
+opencv-python
+tensorboard
+ipykernel

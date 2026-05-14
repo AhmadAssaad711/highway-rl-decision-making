@@ -1,0 +1,15 @@
+# Python environments and generated caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Runtime logs and generated outputs
+*.log
+logs/
+results/
+artifacts/
