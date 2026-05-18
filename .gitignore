@@ -67,6 +67,7 @@ references/
 vipp reports/
 **/VIPP reports/
 *.pdf
+!high-level-highway-rl/docs/paper/high-level-highway-rl-paper.pdf
 *.ppt
 *.pptx
 **/literature review/

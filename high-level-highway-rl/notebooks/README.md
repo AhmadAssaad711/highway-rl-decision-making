@@ -1,5 +1,13 @@
 # Notebook Map
 
+Read the notebooks as a progression:
+
+1. structured highway baselines
+2. model and reward improvements
+3. extensions to congested and laneless environments
+
+Associated paper: [`../docs/paper/high-level-highway-rl-paper.pdf`](../docs/paper/high-level-highway-rl-paper.pdf)
+
 ## Structured Highway
 
 | Notebook | Focus |

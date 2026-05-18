@@ -1,6 +1,6 @@
 # High-Level Highway RL
 
-Notebook workspace for reinforcement-learning experiments in autonomous highway decision making.
+Notebook and paper workspace for reinforcement-learning experiments in autonomous highway decision making.
 
 ## Scope
 
@@ -11,6 +11,14 @@ This work focuses on decision-level behavior:
 - reward and safety-factor studies
 - laneless and unstructured highway environments
 - planning baselines for comparison
+
+## Research Flow
+
+1. Establish baselines in structured highway environments.
+2. Improve the baselines with attention models, PPO variants, and reward-safety studies.
+3. Extend and evaluate the approach in unstructured settings: congested traffic and laneless highways.
+
+Paper: [`docs/paper/high-level-highway-rl-paper.pdf`](docs/paper/high-level-highway-rl-paper.pdf)
 
 ## Notebooks
 
@@ -31,4 +39,4 @@ python -m pip install -r requirements.txt
 
 ## Notes
 
-This is a notebook-only public version. Generated outputs, source scripts, old practice work, and vendor copies are intentionally excluded.
+This public version keeps the notebooks and associated paper. Generated outputs, source scripts, old practice work, and vendor copies are intentionally excluded.
