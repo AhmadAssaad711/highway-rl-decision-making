@@ -64,10 +64,8 @@ my_work/non_code/
 deliverables/
 study reports/
 references/
-vipp reports/
-**/VIPP reports/
 *.pdf
-!high-level-highway-rl/docs/paper/high-level-highway-rl-paper.pdf
+!highway-rl-decision-making/docs/paper/highway-rl-decision-making-paper.pdf
 *.ppt
 *.pptx
 **/literature review/
@@ -76,7 +74,6 @@ vipp reports/
 **/*literature review*/
 
 # Obsidian and research notes
-spring VIPP obsidian notes/
 notes/
 **/.obsidian/
 **/*.canvas

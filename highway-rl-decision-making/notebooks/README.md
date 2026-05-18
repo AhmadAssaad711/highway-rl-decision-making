@@ -6,7 +6,7 @@ Read the notebooks as a progression:
 2. model and reward improvements
 3. extensions to congested and laneless environments
 
-Associated paper: [`../docs/paper/high-level-highway-rl-paper.pdf`](../docs/paper/high-level-highway-rl-paper.pdf)
+Associated paper: [`../docs/paper/highway-rl-decision-making-paper.pdf`](../docs/paper/highway-rl-decision-making-paper.pdf)
 
 ## Structured Highway
 

@@ -1,4 +1,4 @@
-# High-Level Highway RL
+# Highway RL Decision Making
 
 Notebook and paper workspace for reinforcement-learning experiments in autonomous highway decision making.
 
@@ -18,7 +18,7 @@ This work focuses on decision-level behavior:
 2. Improve the baselines with attention models, PPO variants, and reward-safety studies.
 3. Extend and evaluate the approach in unstructured settings: congested traffic and laneless highways.
 
-Paper: [`docs/paper/high-level-highway-rl-paper.pdf`](docs/paper/high-level-highway-rl-paper.pdf)
+Paper: [`docs/paper/highway-rl-decision-making-paper.pdf`](docs/paper/highway-rl-decision-making-paper.pdf)
 
 ## Notebooks
 
