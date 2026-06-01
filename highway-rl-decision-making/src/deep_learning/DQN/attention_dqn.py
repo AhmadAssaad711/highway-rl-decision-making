@@ -386,6 +386,12 @@ def evaluate_with_metrics(
             safety_flow_speed_trace: list[float] = []
             safety_speed_deficit_trace: list[float] = []
             safety_rear_ttc_trace: list[float] = []
+            potential_field_cost_trace: list[float] = []
+            potential_field_penalty_trace: list[float] = []
+            potential_field_vehicle_count_trace: list[float] = []
+            potential_field_max_vehicle_cost_trace: list[float] = []
+            potential_field_closest_longitudinal_gap_trace: list[float] = []
+            potential_field_closest_lateral_gap_trace: list[float] = []
             lane_change_safety_penalty_trace: list[float] = []
             lane_change_safety_risky_count = 0
 
@@ -418,6 +424,21 @@ def evaluate_with_metrics(
                         float(final_info.get("safety_speed_deficit", 0.0))
                     )
                     safety_rear_ttc_trace.append(float(final_info.get("safety_rear_ttc", np.nan)))
+                if "potential_field_cost" in final_info:
+                    potential_field_cost_trace.append(float(final_info.get("potential_field_cost", 0.0)))
+                    potential_field_penalty_trace.append(float(final_info.get("potential_field_penalty", 0.0)))
+                    potential_field_vehicle_count_trace.append(
+                        float(final_info.get("potential_field_vehicle_count", 0.0))
+                    )
+                    potential_field_max_vehicle_cost_trace.append(
+                        float(final_info.get("potential_field_max_vehicle_cost", 0.0))
+                    )
+                    potential_field_closest_longitudinal_gap_trace.append(
+                        float(final_info.get("potential_field_closest_longitudinal_gap", np.nan))
+                    )
+                    potential_field_closest_lateral_gap_trace.append(
+                        float(final_info.get("potential_field_closest_lateral_gap", np.nan))
+                    )
                 if "lane_change_safety_penalty" in final_info:
                     lane_change_penalty = float(final_info.get("lane_change_safety_penalty", 0.0))
                     lane_change_safety_penalty_trace.append(lane_change_penalty)
@@ -452,6 +473,25 @@ def evaluate_with_metrics(
                         "safety_avg_flow_speed": float(np.nanmean(safety_flow_speed_trace)),
                         "safety_avg_speed_deficit": float(np.nanmean(safety_speed_deficit_trace)),
                         "safety_avg_rear_ttc": float(np.nanmean(safety_rear_ttc_trace)),
+                    }
+                )
+            if potential_field_cost_trace:
+                summary.update(
+                    {
+                        "potential_field_avg_cost": float(np.nanmean(potential_field_cost_trace)),
+                        "potential_field_avg_penalty": float(np.nanmean(potential_field_penalty_trace)),
+                        "potential_field_avg_vehicle_count": float(
+                            np.nanmean(potential_field_vehicle_count_trace)
+                        ),
+                        "potential_field_avg_max_vehicle_cost": float(
+                            np.nanmean(potential_field_max_vehicle_cost_trace)
+                        ),
+                        "potential_field_avg_closest_longitudinal_gap": float(
+                            np.nanmean(potential_field_closest_longitudinal_gap_trace)
+                        ),
+                        "potential_field_avg_closest_lateral_gap": float(
+                            np.nanmean(potential_field_closest_lateral_gap_trace)
+                        ),
                     }
                 )
             if lane_change_safety_penalty_trace:
@@ -984,6 +1024,12 @@ def train_and_evaluate(
         "safety_avg_flow_speed",
         "safety_avg_speed_deficit",
         "safety_avg_rear_ttc",
+        "potential_field_avg_cost",
+        "potential_field_avg_penalty",
+        "potential_field_avg_vehicle_count",
+        "potential_field_avg_max_vehicle_cost",
+        "potential_field_avg_closest_longitudinal_gap",
+        "potential_field_avg_closest_lateral_gap",
         "lane_change_safety_avg_penalty",
         "lane_change_safety_risky_actions",
     ]:

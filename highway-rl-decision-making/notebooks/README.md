@@ -25,7 +25,7 @@ Associated paper: [`../docs/paper/highway-rl-decision-making-paper.pdf`](../docs
 | --- | --- |
 | [`congested_traffic_policy.ipynb`](congested_traffic/congested_traffic_policy.ipynb) | Dense traffic policy experiment. |
 | [`congested_traffic_policy_v2.ipynb`](congested_traffic/congested_traffic_policy_v2.ipynb) | Second congested traffic policy variant. |
-| [`congested_reward_safety_factor_study.ipynb`](congested_traffic/congested_reward_safety_factor_study.ipynb) | Reward and safety-factor study. |
+| [`congested_reward_safety_factor_study.ipynb`](congested_traffic/congested_reward_safety_factor_study.ipynb) | Attention DQN with base reward plus potential-field reward shaping. |
 
 ## Laneless and Unstructured
 

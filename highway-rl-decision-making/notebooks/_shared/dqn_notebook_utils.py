@@ -167,6 +167,7 @@ def build_env_config(
     rear_flow: dict[str, Any] | None = None,
     traffic_flow_reward: dict[str, Any] | None = None,
     safety_ttc_flow_reward: dict[str, Any] | None = None,
+    potential_field_reward: dict[str, Any] | None = None,
     driver_aggressiveness: dict[str, Any] | None = None,
     driver_aggressiveness_observation: dict[str, Any] | None = None,
     ttc_observation: dict[str, Any] | None = None,
@@ -194,6 +195,7 @@ def build_env_config(
         "rear_flow": dict(rear_flow or {"enabled": False}),
         "traffic_flow_reward": dict(traffic_flow_reward or {"enabled": False}),
         "safety_ttc_flow_reward": dict(safety_ttc_flow_reward or {"enabled": False}),
+        "potential_field_reward": dict(potential_field_reward or {"enabled": False}),
         "driver_aggressiveness": dict(driver_aggressiveness or {"enabled": False}),
         "driver_aggressiveness_observation": dict(driver_aggressiveness_observation or {"enabled": False}),
         "ttc_observation": dict(ttc_observation or {"enabled": False}),
@@ -265,6 +267,12 @@ def adaptive_metric_columns(eval_df: pd.DataFrame) -> list[str]:
         "safety_avg_flow_speed",
         "safety_avg_speed_deficit",
         "safety_avg_rear_ttc",
+        "potential_field_avg_cost",
+        "potential_field_avg_penalty",
+        "potential_field_avg_vehicle_count",
+        "potential_field_avg_max_vehicle_cost",
+        "potential_field_avg_closest_longitudinal_gap",
+        "potential_field_avg_closest_lateral_gap",
         "lane_change_safety_avg_penalty",
         "lane_change_safety_risky_actions",
         "driver_aggressiveness_mean",
@@ -300,6 +308,8 @@ def build_metric_summary(eval_df: pd.DataFrame) -> pd.DataFrame:
     for column, label in [
         ("lane_change_safety_avg_penalty", "Lane-Change Safety Penalty"),
         ("lane_change_safety_risky_actions", "Risky Lane-Change Actions"),
+        ("potential_field_avg_cost", "Potential Field Cost"),
+        ("potential_field_avg_penalty", "Potential Field Penalty"),
     ]:
         if column not in eval_df.columns:
             continue
@@ -385,6 +395,7 @@ def evaluate_saved_model(
     name: str,
     label: str,
 ) -> dict[str, Any]:
+    summary_path = Path(summary_path).expanduser().resolve()
     if not summary_path.exists():
         raise RuntimeError("Run the training cell once so a saved model exists.")
 
@@ -392,15 +403,29 @@ def evaluate_saved_model(
     print(json.dumps(env_config, indent=2))
 
     saved_summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    eval_dir = summary_path.parent / name
+    raw_model_path = Path(saved_summary["model_path"]).expanduser()
+    model_candidates = [raw_model_path]
+    if not raw_model_path.is_absolute():
+        model_candidates.append(summary_path.parent / raw_model_path)
+    model_candidates.append(summary_path.parent / "models" / raw_model_path.name)
+    if raw_model_path.suffix != ".zip":
+        model_candidates.extend(Path(f"{candidate}.zip") for candidate in list(model_candidates))
+    model_path = next((candidate.resolve() for candidate in model_candidates if candidate.exists()), None)
+    if model_path is None:
+        searched = "\n".join(f"  - {candidate}" for candidate in model_candidates)
+        raise FileNotFoundError(f"Saved model file was not found. Checked:\n{searched}")
+
+    eval_dir = (summary_path.parent / name).resolve()
     eval_dir.mkdir(parents=True, exist_ok=True)
-    model = DQN.load(saved_summary["model_path"])
+    model = DQN.load(model_path)
     eval_rows = trainer.evaluate_with_metrics(model, episodes=episodes, seed=seed, render_mode=None, config=env_config)
     eval_df = pd.DataFrame(eval_rows)
 
-    metrics_path = eval_dir / "evaluation_metrics.json"
-    detail_plot_path = eval_dir / "evaluation_metrics.png"
-    summary_plot_path = eval_dir / "evaluation_summary.png"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = eval_dir / "metrics.json"
+    detail_plot_path = eval_dir / "metrics.png"
+    summary_plot_path = eval_dir / "summary.png"
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
     metrics_path.write_text(eval_df.to_json(orient="records", indent=2), encoding="utf-8")
     trainer.plot_evaluation_metrics(eval_rows, detail_plot_path)
     summary_df = plot_metric_summary(eval_df, summary_plot_path, f"{label} Saved-Model Evaluation")
@@ -408,14 +433,15 @@ def evaluate_saved_model(
     output = {
         "episodes": int(episodes),
         "seed": int(seed),
-        "model_path": saved_summary["model_path"],
+        "model_path": str(model_path),
         "env_config": env_config,
         "evaluation_metrics_path": str(metrics_path),
         "detailed_plot_path": str(detail_plot_path),
         "summary_plot_path": str(summary_plot_path),
         "metric_summary": summary_df.to_dict(orient="records"),
     }
-    (eval_dir / "evaluation_summary.json").write_text(json.dumps(output, indent=2), encoding="utf-8")
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    (eval_dir / "summary.json").write_text(json.dumps(output, indent=2), encoding="utf-8")
     print(json.dumps(output, indent=2))
     display_image_if_exists(detail_plot_path)
     display_image_if_exists(summary_plot_path)

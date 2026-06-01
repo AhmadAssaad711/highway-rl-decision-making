@@ -17,6 +17,7 @@ ADAPTIVE_LONGITUDINAL_CONFIG_KEY = "adaptive_longitudinal"
 REAR_FLOW_CONFIG_KEY = "rear_flow"
 TRAFFIC_FLOW_REWARD_CONFIG_KEY = "traffic_flow_reward"
 SAFETY_TTC_FLOW_REWARD_CONFIG_KEY = "safety_ttc_flow_reward"
+POTENTIAL_FIELD_REWARD_CONFIG_KEY = "potential_field_reward"
 DRIVER_AGGRESSIVENESS_CONFIG_KEY = "driver_aggressiveness"
 DRIVER_AGGRESSIVENESS_OBSERVATION_CONFIG_KEY = "driver_aggressiveness_observation"
 TTC_OBSERVATION_CONFIG_KEY = "ttc_observation"
@@ -83,6 +84,22 @@ DEFAULT_SAFETY_TTC_FLOW_REWARD_CONFIG: dict[str, Any] = {
     "rear_ttc_pressure": 5.0,
     "rear_pressure_floor": 0.25,
     "flow_radius": 120.0,
+    "lanes": "ego_and_adjacent",
+}
+
+DEFAULT_POTENTIAL_FIELD_REWARD_CONFIG: dict[str, Any] = {
+    "enabled": False,
+    "weight": 0.25,
+    "sensing_range": 120.0,
+    "field_magnitude": 0.5,
+    "field_px": 2.0,
+    "field_py": 2.0,
+    "field_pt": 1.0,
+    "timegap": 0.7,
+    "lateral_timegap": 0.7,
+    "max_cost": 1.0,
+    "min_longitudinal_scale": 1e-3,
+    "min_lateral_scale": 1e-3,
     "lanes": "ego_and_adjacent",
 }
 
@@ -267,6 +284,33 @@ def build_safety_ttc_flow_reward_config(
     return merged
 
 
+def build_potential_field_reward_config(
+    potential_field_reward_config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    merged = deepcopy(DEFAULT_POTENTIAL_FIELD_REWARD_CONFIG)
+    if potential_field_reward_config:
+        merged.update(dict(potential_field_reward_config))
+    merged["enabled"] = bool(merged.get("enabled", False))
+    merged["weight"] = float(max(0.0, merged["weight"]))
+    merged["sensing_range"] = float(max(0.0, merged["sensing_range"]))
+    merged["field_magnitude"] = float(max(0.0, merged["field_magnitude"]))
+    merged["field_px"] = float(max(1e-6, merged["field_px"]))
+    merged["field_py"] = float(max(1e-6, merged["field_py"]))
+    merged["field_pt"] = float(max(1e-6, merged["field_pt"]))
+    merged["timegap"] = float(max(0.0, merged["timegap"]))
+    merged["lateral_timegap"] = float(max(0.0, merged["lateral_timegap"]))
+    merged["max_cost"] = float(max(0.0, merged["max_cost"]))
+    merged["min_longitudinal_scale"] = float(max(1e-9, merged["min_longitudinal_scale"]))
+    merged["min_lateral_scale"] = float(max(1e-9, merged["min_lateral_scale"]))
+    merged["lanes"] = str(merged.get("lanes", "ego_and_adjacent")).lower()
+    if merged["lanes"] not in {"current", "ego", "ego_and_adjacent", "all"}:
+        raise ValueError(
+            f"Unsupported potential_field_reward lanes={merged['lanes']!r}. "
+            "Expected 'current', 'ego', 'ego_and_adjacent', or 'all'."
+        )
+    return merged
+
+
 def build_driver_aggressiveness_config(
     driver_aggressiveness_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -372,6 +416,7 @@ def split_highway_env_and_custom_configs(
     dict[str, Any],
     dict[str, Any],
     dict[str, Any],
+    dict[str, Any],
 ]:
     base_config = dict(config or {})
     adaptive_config = build_adaptive_longitudinal_config(
@@ -383,6 +428,9 @@ def split_highway_env_and_custom_configs(
     )
     safety_ttc_flow_reward_config = build_safety_ttc_flow_reward_config(
         base_config.pop(SAFETY_TTC_FLOW_REWARD_CONFIG_KEY, None)
+    )
+    potential_field_reward_config = build_potential_field_reward_config(
+        base_config.pop(POTENTIAL_FIELD_REWARD_CONFIG_KEY, None)
     )
     driver_aggressiveness_config = build_driver_aggressiveness_config(
         base_config.pop(DRIVER_AGGRESSIVENESS_CONFIG_KEY, None)
@@ -402,6 +450,7 @@ def split_highway_env_and_custom_configs(
         rear_flow_config,
         traffic_flow_reward_config,
         safety_ttc_flow_reward_config,
+        potential_field_reward_config,
         driver_aggressiveness_config,
         driver_aggressiveness_observation_config,
         ttc_observation_config,
@@ -420,6 +469,10 @@ def _forward_speed(vehicle) -> float:
     return float(vehicle.speed * np.cos(getattr(vehicle, "heading", 0.0)))
 
 
+def _lateral_speed(vehicle) -> float:
+    return float(vehicle.speed * np.sin(getattr(vehicle, "heading", 0.0)))
+
+
 def _lane_longitudinal(vehicle, lane) -> float:
     longitudinal, _ = lane.local_coordinates(vehicle.position)
     return float(longitudinal)
@@ -431,6 +484,14 @@ def _vehicle_clearance(ego_vehicle, other_vehicle, ego_s: float, other_s: float)
         abs(float(other_s) - float(ego_s))
         - 0.5 * float(getattr(ego_vehicle, "LENGTH", 0.0) + getattr(other_vehicle, "LENGTH", 0.0)),
     )
+
+
+def _vehicle_length(vehicle) -> float:
+    return float(getattr(vehicle, "LENGTH", getattr(vehicle, "length", 5.0)))
+
+
+def _vehicle_width(vehicle) -> float:
+    return float(getattr(vehicle, "WIDTH", getattr(vehicle, "width", 2.0)))
 
 
 def adjacent_lane_index(env: gym.Env, side: str):
@@ -1311,6 +1372,156 @@ class SafetyTTCFlowRewardWrapper(gym.Wrapper):
         }
 
 
+class PotentialFieldRewardWrapper(gym.Wrapper):
+    """Penalize proximity to surrounding vehicles with an ellipsoidal potential field."""
+
+    def __init__(
+        self,
+        env: gym.Env,
+        potential_field_reward_config: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(env)
+        self.potential_field_reward_config = build_potential_field_reward_config(
+            potential_field_reward_config
+        )
+
+    def reset(self, **kwargs):
+        observation, info = self.env.reset(**kwargs)
+        info = dict(info)
+        info.update(self._potential_field_info(base_reward=0.0, shaped_reward=0.0))
+        return observation, info
+
+    def step(self, action):
+        observation, base_reward, terminated, truncated, info = self.env.step(action)
+        cost, metrics = self._compute_cost()
+        penalty = float(self.potential_field_reward_config["weight"]) * float(cost)
+        shaped_reward = float(base_reward) - penalty
+        info = dict(info)
+        info.update(metrics)
+        info.update(
+            {
+                "potential_field_base_reward": float(base_reward),
+                "potential_field_shaped_reward": float(shaped_reward),
+                "potential_field_penalty": float(penalty),
+            }
+        )
+        return observation, shaped_reward, terminated, truncated, info
+
+    def _compute_cost(self) -> tuple[float, dict[str, float]]:
+        if not self.potential_field_reward_config["enabled"]:
+            return 0.0, self._potential_field_info(base_reward=0.0, shaped_reward=0.0)
+
+        cfg = self.potential_field_reward_config
+        ego_vehicle = getattr(self.unwrapped, "vehicle", None)
+        road = getattr(self.unwrapped, "road", None)
+        ego_lane_index = getattr(ego_vehicle, "lane_index", None)
+        if ego_vehicle is None or road is None or ego_lane_index is None:
+            return 0.0, self._potential_field_info(base_reward=0.0, shaped_reward=0.0)
+
+        ego_lane = road.network.get_lane(ego_lane_index)
+        ego_s, ego_lateral = ego_lane.local_coordinates(ego_vehicle.position)
+        ego_speed = _forward_speed(ego_vehicle)
+        ego_lateral_speed = _lateral_speed(ego_vehicle)
+        candidate_lanes = set(self._candidate_lane_indices(ego_lane_index))
+
+        vehicle_count = 0
+        total_cost = 0.0
+        max_vehicle_cost = 0.0
+        closest_longitudinal_gap = float(cfg["sensing_range"])
+        closest_lateral_gap = np.nan
+
+        for other in getattr(road, "vehicles", []):
+            if other is ego_vehicle:
+                continue
+            other_lane_index = getattr(other, "lane_index", None)
+            if candidate_lanes and other_lane_index not in candidate_lanes:
+                continue
+
+            other_s, other_lateral = ego_lane.local_coordinates(other.position)
+            dx = float(other_s - ego_s)
+            if abs(dx) > float(cfg["sensing_range"]):
+                continue
+
+            dy = float(other_lateral - ego_lateral)
+            longitudinal_gap = max(0.0, abs(dx) - 0.5 * (_vehicle_length(ego_vehicle) + _vehicle_length(other)))
+            lateral_gap = max(0.0, abs(dy) - 0.5 * (_vehicle_width(ego_vehicle) + _vehicle_width(other)))
+            closest_longitudinal_gap = min(closest_longitudinal_gap, longitudinal_gap)
+            closest_lateral_gap = lateral_gap if np.isnan(closest_lateral_gap) else min(closest_lateral_gap, lateral_gap)
+
+            if dx >= 0.0:
+                closing_speed = ego_speed - _forward_speed(other)
+            else:
+                closing_speed = _forward_speed(other) - ego_speed
+            lateral_closing_speed = abs(ego_lateral_speed - _lateral_speed(other))
+
+            critical_a = max(
+                0.5 * (_vehicle_length(ego_vehicle) + _vehicle_length(other)),
+                float(cfg["min_longitudinal_scale"]),
+            )
+            critical_b = max(
+                0.5 * (_vehicle_width(ego_vehicle) + _vehicle_width(other)),
+                float(cfg["min_lateral_scale"]),
+            )
+            broad_a = critical_a + float(cfg["timegap"]) * max(closing_speed, 0.0)
+            broad_b = critical_b + float(cfg["lateral_timegap"]) * lateral_closing_speed
+
+            vehicle_cost = self._ellipsoid(dx, dy, critical_a, critical_b)
+            vehicle_cost += self._ellipsoid(dx, dy, broad_a, broad_b)
+            total_cost += vehicle_cost
+            max_vehicle_cost = max(max_vehicle_cost, vehicle_cost)
+            vehicle_count += 1
+
+        cost = float(min(total_cost, float(cfg["max_cost"])))
+        metrics = {
+            "potential_field_cost": cost,
+            "potential_field_vehicle_count": float(vehicle_count),
+            "potential_field_max_vehicle_cost": float(max_vehicle_cost),
+            "potential_field_closest_longitudinal_gap": float(closest_longitudinal_gap),
+            "potential_field_closest_lateral_gap": float(closest_lateral_gap),
+        }
+        return cost, metrics
+
+    def _candidate_lane_indices(self, lane_index) -> list[tuple]:
+        lane_scope = str(self.potential_field_reward_config["lanes"]).lower()
+        if lane_scope == "all":
+            return []
+
+        road = self.unwrapped.road
+        lane_from, lane_to, lane_id = lane_index
+        lane_count = len(road.network.graph[lane_from][lane_to])
+        if lane_scope in {"current", "ego"}:
+            return [lane_index]
+
+        candidates = [lane_index]
+        for delta in (-1, 1):
+            candidate_id = int(lane_id) + delta
+            if 0 <= candidate_id < lane_count:
+                candidates.append((lane_from, lane_to, candidate_id))
+        return candidates
+
+    def _ellipsoid(self, dx: float, dy: float, a: float, b: float) -> float:
+        cfg = self.potential_field_reward_config
+        scaled = (
+            (abs(float(dx)) / max(float(a), 1e-9)) ** float(cfg["field_px"])
+            + (abs(float(dy)) / max(float(b), 1e-9)) ** float(cfg["field_py"])
+            + 1.0
+        )
+        return float(float(cfg["field_magnitude"]) / (scaled ** float(cfg["field_pt"])))
+
+    @staticmethod
+    def _potential_field_info(base_reward: float, shaped_reward: float) -> dict[str, float]:
+        return {
+            "potential_field_cost": 0.0,
+            "potential_field_penalty": 0.0,
+            "potential_field_vehicle_count": 0.0,
+            "potential_field_max_vehicle_cost": 0.0,
+            "potential_field_closest_longitudinal_gap": np.nan,
+            "potential_field_closest_lateral_gap": np.nan,
+            "potential_field_base_reward": float(base_reward),
+            "potential_field_shaped_reward": float(shaped_reward),
+        }
+
+
 class LaneChangeSafetyRewardWrapper(gym.Wrapper):
     """Penalize lane-change actions whose target lane has unsafe front/rear TTC or gap."""
 
@@ -1582,6 +1793,7 @@ def make_highway_env_with_adaptive_longitudinal(
         rear_flow_config,
         traffic_flow_reward_config,
         safety_ttc_flow_reward_config,
+        potential_field_reward_config,
         driver_aggressiveness_config,
         driver_aggressiveness_observation_config,
         ttc_observation_config,
@@ -1594,6 +1806,11 @@ def make_highway_env_with_adaptive_longitudinal(
         env = DriverAggressivenessWrapper(
             env,
             driver_aggressiveness_config=driver_aggressiveness_config,
+        )
+    if potential_field_reward_config["enabled"]:
+        env = PotentialFieldRewardWrapper(
+            env,
+            potential_field_reward_config=potential_field_reward_config,
         )
     if safety_ttc_flow_reward_config["enabled"]:
         env = SafetyTTCFlowRewardWrapper(
