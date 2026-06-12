@@ -9,3 +9,5 @@ pygame
 opencv-python
 tensorboard
 ipykernel
+qpsolvers
+osqp

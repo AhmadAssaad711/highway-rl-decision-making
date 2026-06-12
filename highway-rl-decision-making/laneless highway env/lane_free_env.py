@@ -169,37 +169,34 @@ class LaneFreeTrafficEnv(AbstractEnv):
     untouched.
     """
 
-    VEHICLE_DIMENSIONS = np.array(
-        [
-            [3.20, 1.60],
-            [3.90, 1.70],
-            [4.25, 1.80],
-            [4.55, 1.82],
-            [4.60, 1.77],
-            [5.15, 1.84],
-        ],
-        dtype=float,
-    )
+    VEHICLE_DIMENSIONS = np.array([[3.50, 1.80], [3.50, 1.80]], dtype=float)
+    EGO_DIMENSIONS = np.array([3.20, 1.60], dtype=float)
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
         config = super().default_config()
         config.update(
             {
-                "road_length": 1000.0,
+                "road_length": 500.0,
                 "road_width": 10.2,
-                "dt": 1.0 / 15.0,
-                "simulation_frequency": 15,
-                "policy_frequency": 15,
-                "vehicles_count": 30,
+                "dt": 0.25,
+                "simulation_frequency": 4,
+                "policy_frequency": 4,
+                "vehicles_count": 35,
                 "sensing_range": 80.0,
-                "episode_steps": 2000,
-                "duration": 2000,
+                "episode_steps": 800,
+                "duration": 800,
+                "terminate_on_collision": True,
                 "gamma_nudge": 0.0,
                 "ego_controlled": True,
-                "neighbors_count": 8,
-                "desired_speed_range": [25.0, 35.0],
-                "initial_speed_fraction_range": [0.0, 0.2],
+                "neighbors_count": 5,
+                "ego_dimensions": cls.EGO_DIMENSIONS.tolist(),
+                "vehicle_dimensions": cls.VEHICLE_DIMENSIONS.tolist(),
+                "placeholder_neighbor": [80.0, 10.2, 0.0, 0.0],
+                "desired_speed_range": [18.0, 22.0],
+                "initial_speed_fraction_range": [0.75, 1.0],
+                "observation_vmax": 24.0,
+                "observation_vymax": 7.2,
                 "force": {
                     "k_target_x": 2.5,
                     "k_target_y": 2.0,
@@ -235,9 +232,10 @@ class LaneFreeTrafficEnv(AbstractEnv):
             _deep_update(self.config, config)
 
     def define_spaces(self) -> None:
-        rows = 1 + int(self.config.get("neighbors_count", 8))
+        rows = 1 + int(self.config.get("neighbors_count", 5))
+        features = rows * 7
         self.action_space = spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
-        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(rows, 7), dtype=np.float32)
+        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(features,), dtype=np.float32)
         self.action_type = None
         self.observation_type = None
 
@@ -260,6 +258,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
         self._last_boundary_violations = 0
         self._last_collision_count = 0
         self._last_active_collision_count = 0
+        self._last_ego_collision_count = 0
         self._last_ego_collision = False
         self._cumulative_collision_count = 0
         self._active_collision_pairs: set[tuple[int, int]] = set()
@@ -291,10 +290,16 @@ class LaneFreeTrafficEnv(AbstractEnv):
         self.np_random.shuffle(x_slots)
         vehicles: list[LaneFreeVehicle] = []
 
+        vehicle_dimensions = np.asarray(self.config.get("vehicle_dimensions", self.VEHICLE_DIMENSIONS), dtype=float)
+        ego_length, ego_width = np.asarray(self.config.get("ego_dimensions", self.EGO_DIMENSIONS), dtype=float)
+
         for index in range(count):
-            vehicle_length, vehicle_width = self.VEHICLE_DIMENSIONS[
-                self.np_random.integers(0, len(self.VEHICLE_DIMENSIONS))
-            ]
+            if index == 0:
+                vehicle_length, vehicle_width = ego_length, ego_width
+            else:
+                vehicle_length, vehicle_width = vehicle_dimensions[
+                    self.np_random.integers(0, len(vehicle_dimensions))
+                ]
             desired_speed = float(self.np_random.uniform(desired_low, desired_high))
             speed_fraction = float(self.np_random.uniform(speed_low, speed_high))
             x = float((x_slots[index] + self.np_random.uniform(-0.35, 0.35) * road_length / count) % road_length)
@@ -348,7 +353,11 @@ class LaneFreeTrafficEnv(AbstractEnv):
             low, high = float(bounds["ax_min"]), float(bounds["ax_max"])
         else:
             low, high = float(bounds["ay_min"]), float(bounds["ay_max"])
-        return low + 0.5 * (float(value) + 1.0) * (high - low)
+        value = float(np.clip(value, -1.0, 1.0))
+        if low < 0.0 < high:
+            scale = high if value >= 0.0 else abs(low)
+            return value * max(scale, 1e-6)
+        return low + 0.5 * (value + 1.0) * (high - low)
 
     def _compute_accelerations(self) -> np.ndarray:
         vehicles = self.road.vehicles
@@ -463,6 +472,10 @@ class LaneFreeTrafficEnv(AbstractEnv):
         new_pairs = active_pairs - self._active_collision_pairs
         self._last_collision_count = len(new_pairs)
         self._last_active_collision_count = len(active_pairs)
+        self._last_ego_collision_count = sum(
+            int(vehicles[first].is_ego or vehicles[second].is_ego)
+            for first, second in new_pairs
+        )
         self._last_ego_collision = ego_collision
         self._cumulative_collision_count += len(new_pairs)
         self._active_collision_pairs = active_pairs
@@ -477,22 +490,24 @@ class LaneFreeTrafficEnv(AbstractEnv):
         rows = [self._observation_row(vehicle, ego) for vehicle in selected]
         while len(rows) < 1 + int(self.config["neighbors_count"]):
             rows.append(np.zeros(7, dtype=np.float32))
-        return np.asarray(rows, dtype=np.float32)
+        return np.asarray(rows, dtype=np.float32).reshape(-1)
 
     def _observation_row(self, vehicle: LaneFreeVehicle, ego: LaneFreeVehicle) -> np.ndarray:
         road_width = float(self.config["road_width"])
         sensing_range = float(self.config["sensing_range"])
+        observation_vmax = max(float(self.config.get("observation_vmax", 24.0)), 1e-6)
+        observation_vymax = max(float(self.config.get("observation_vymax", 0.3 * observation_vmax)), 1e-6)
         signed_dx = 0.0 if vehicle is ego else self._signed_distance(ego.position[0], vehicle.position[0])
         dy = 0.0 if vehicle is ego else float(vehicle.position[1] - ego.position[1])
         return np.array(
             [
                 np.clip(signed_dx / sensing_range, -1.0, 1.0),
                 np.clip(dy / road_width, -1.0, 1.0),
-                vehicle.vx / 40.0,
-                vehicle.vy / 12.0,
+                vehicle.vx / observation_vmax,
+                vehicle.vy / observation_vymax,
                 vehicle.length / 5.15,
                 vehicle.width / 1.84,
-                vehicle.desired_speed / 35.0,
+                vehicle.desired_speed / observation_vmax,
             ],
             dtype=np.float32,
         )
@@ -510,7 +525,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
         )
 
     def _is_terminated(self) -> bool:
-        return bool(self._last_ego_collision)
+        return bool(self.config.get("terminate_on_collision", True) and self._last_ego_collision)
 
     def _is_truncated(self) -> bool:
         return self.steps >= int(self.config.get("episode_steps", self.config.get("duration", 2000)))
@@ -522,6 +537,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
             "mean_speed": self.mean_speed,
             "collisions": int(self._last_collision_count),
             "active_collisions": int(self._last_active_collision_count),
+            "ego_collision_events": int(self._last_ego_collision_count),
             "cumulative_collisions": int(self._cumulative_collision_count),
             "ego_collision": bool(self._last_ego_collision),
             "boundary_violations": int(self._last_boundary_violations),
