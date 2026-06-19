@@ -2,7 +2,7 @@ gymnasium
 highway-env
 stable-baselines3[extra]
 torch
-numpy
+numpy<2
 pandas
 matplotlib
 pygame
@@ -11,3 +11,4 @@ tensorboard
 ipykernel
 qpsolvers
 osqp
+clarabel
