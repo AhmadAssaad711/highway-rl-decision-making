@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from guided_cbf_minimal import install_minimal_guided_cbf
 from laneless_training_registry import archive_training_outputs, make_run_tag
 
 
@@ -38,6 +39,21 @@ def exec_notebook_cell(notebook: dict[str, Any], notebook_path: Path, cell_index
     source = "".join(notebook["cells"][cell_index].get("source", []))
     print(f"[notebook-task] executing notebook cell {cell_index}", flush=True)
     exec(compile(source, f"{notebook_path}:cell-{cell_index}", "exec"), namespace)
+
+
+def exec_notebook_cell_tail(
+    notebook: dict[str, Any],
+    notebook_path: Path,
+    cell_index: int,
+    namespace: dict[str, Any],
+    marker: str,
+) -> None:
+    source = "".join(notebook["cells"][cell_index].get("source", []))
+    if marker not in source:
+        raise RuntimeError(f"Could not find marker {marker!r} in notebook cell {cell_index}")
+    tail = source[source.index(marker) :]
+    print(f"[notebook-task] executing notebook cell {cell_index} from {marker!r}", flush=True)
+    exec(compile(tail, f"{notebook_path}:cell-{cell_index}-tail", "exec"), namespace)
 
 
 def exec_notebook_cells(notebook_path: Path, cell_indices: list[int], namespace: dict[str, Any]) -> None:
@@ -140,7 +156,17 @@ def main() -> int:
         },
         flush=True,
     )
-    exec_notebook_cell(notebook, notebook_path, int(task["cell"]), namespace)
+    if args.task == "guided-ddpg-cbf-train":
+        install_minimal_guided_cbf(namespace)
+        exec_notebook_cell_tail(
+            notebook,
+            notebook_path,
+            int(task["cell"]),
+            namespace,
+            "RUN_GUIDED_DDPG_CBF_TRAIN =",
+        )
+    else:
+        exec_notebook_cell(notebook, notebook_path, int(task["cell"]), namespace)
     archived = archive_training_outputs(
         namespace=namespace,
         task_name=args.task,

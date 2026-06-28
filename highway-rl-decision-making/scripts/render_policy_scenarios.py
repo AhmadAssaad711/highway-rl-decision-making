@@ -21,6 +21,7 @@ import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 from stable_baselines3 import DDPG
 
+from guided_cbf_minimal import install_minimal_guided_cbf
 
 warnings.filterwarnings("ignore", message="OSQP exited.*")
 
@@ -140,6 +141,7 @@ def load_notebook_namespace(repo_root: Path) -> dict[str, Any]:
     else:
         raise RuntimeError("Could not find guided DDPG-CBF actor update cell")
 
+    install_minimal_guided_cbf(namespace)
     return namespace
 
 

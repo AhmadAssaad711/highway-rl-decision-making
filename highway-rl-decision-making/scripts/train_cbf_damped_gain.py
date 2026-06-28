@@ -68,10 +68,11 @@ def set_vec_cbf_gains(vec_env: Any, k0: float, k1: float) -> None:
         set_cbf_gains(env, k0, k1)
 
 
-def make_eval_env(namespace: dict[str, Any], seed: int, k0: float, k1: float) -> Any:
+def make_eval_env(namespace: dict[str, Any], seed: int, k0: float, k1: float, eps_side: float) -> Any:
     env = namespace["make_cbf_single_env"](
         seed=seed,
         lambda_filter=namespace["CBF_FILTER_REWARD_LAMBDA"],
+        eps_side=eps_side,
     )
     set_cbf_gains(env, k0, k1)
     namespace["configure_paper_evaluation_env"](env, steps=namespace["PAPER_EVAL_STEPS"])
@@ -83,12 +84,13 @@ def evaluate_model(
     model: DDPG,
     k0: float,
     k1: float,
+    eps_side: float,
     episodes: int,
     seed: int,
 ) -> pd.DataFrame:
     rows: list[dict[str, float]] = []
     for episode in range(episodes):
-        env = make_eval_env(namespace, seed + episode, k0, k1)
+        env = make_eval_env(namespace, seed + episode, k0, k1, eps_side)
         obs, _ = env.reset(seed=seed + episode)
         done = False
         step_count = 0
@@ -183,6 +185,7 @@ class DampedGainEvalCallback(BaseCallback):
         namespace: dict[str, Any],
         k0: float,
         k1: float,
+        eps_side: float,
         eval_freq: int,
         episodes: int,
         seed: int,
@@ -191,6 +194,7 @@ class DampedGainEvalCallback(BaseCallback):
         self.namespace = namespace
         self.k0 = float(k0)
         self.k1 = float(k1)
+        self.eps_side = float(eps_side)
         self.eval_freq = int(eval_freq)
         self.episodes = int(episodes)
         self.seed = int(seed)
@@ -206,6 +210,7 @@ class DampedGainEvalCallback(BaseCallback):
             self.model,
             self.k0,
             self.k1,
+            self.eps_side,
             episodes=self.episodes,
             seed=self.seed + self.num_timesteps,
         )
@@ -213,6 +218,7 @@ class DampedGainEvalCallback(BaseCallback):
         row["timesteps"] = float(self.num_timesteps)
         row["k0"] = self.k0
         row["k1"] = self.k1
+        row["eps_side"] = self.eps_side
         self.records.append(row)
         print(
             "[train-eval]"
@@ -245,7 +251,8 @@ def plot_results(history: pd.DataFrame, final_summary: pd.DataFrame, output_path
     final = final_summary.iloc[0]
     fig.suptitle(
         "Retrained DDPG-CBF "
-        f"k0={float(final['k0']):.2f}, k1={float(final['k1']):.2f}; "
+        f"k0={float(final['k0']):.2f}, k1={float(final['k1']):.2f}, "
+        f"eps={float(final['eps_side']):.3f}; "
         f"final return={float(final['return_mean']):.1f}, "
         f"intervention={float(final['intervention_rate']):.1%}",
         fontsize=12,
@@ -259,6 +266,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Retrain DDPG-CBF with explicit damped-system CBF gains.")
     parser.add_argument("--k0", type=float, default=5.29)
     parser.add_argument("--k1", type=float, default=3.68)
+    parser.add_argument("--eps-side", type=float, default=None)
     parser.add_argument("--lambda-filter", type=float, default=None)
     parser.add_argument("--timesteps", type=int, default=50_000)
     parser.add_argument("--eval-episodes", type=int, default=50)
@@ -283,8 +291,9 @@ def main() -> int:
     if args.lambda_filter is not None:
         namespace["CBF_FILTER_REWARD_LAMBDA"] = float(args.lambda_filter)
     lambda_filter = float(namespace["CBF_FILTER_REWARD_LAMBDA"])
+    eps_side = float(namespace["CBF_EPS_SIDE"] if args.eps_side is None else args.eps_side)
 
-    tag = f"k0_{args.k0:.2f}_k1_{args.k1:.2f}_lambda_{lambda_filter:.3f}".replace(".", "p")
+    tag = f"k0_{args.k0:.2f}_k1_{args.k1:.2f}_lambda_{lambda_filter:.3f}_eps_{eps_side:.3f}".replace(".", "p")
     output_dir = namespace["ARTIFACT_DIR"] / "cbf_damped_retrain" / tag
     output_dir.mkdir(parents=True, exist_ok=True)
     model_path = output_dir / "model.zip"
@@ -298,6 +307,7 @@ def main() -> int:
         {
             "k0": args.k0,
             "k1": args.k1,
+            "eps_side": eps_side,
             "lambda_filter": lambda_filter,
             "timesteps": args.timesteps,
             "eval_episodes": args.eval_episodes,
@@ -310,6 +320,7 @@ def main() -> int:
     train_env = namespace["make_cbf_training_env"](
         seed=args.seed,
         lambda_filter=lambda_filter,
+        eps_side=eps_side,
         n_envs=args.n_envs,
         use_subproc=False,
     )
@@ -320,6 +331,7 @@ def main() -> int:
         namespace,
         args.k0,
         args.k1,
+        eps_side,
         eval_freq=int(namespace["TRAIN_EVAL_EVERY"]),
         episodes=args.train_eval_episodes,
         seed=args.seed + 70_000,
@@ -360,12 +372,14 @@ def main() -> int:
         model,
         args.k0,
         args.k1,
+        eps_side,
         episodes=args.eval_episodes,
         seed=args.seed + 90_000,
     )
     final_metrics.to_csv(final_metrics_path, index=False)
     final_summary = summarize(final_metrics)
     final_summary.insert(0, "lambda_filter", lambda_filter)
+    final_summary.insert(0, "eps_side", eps_side)
     final_summary.insert(0, "k1", float(args.k1))
     final_summary.insert(0, "k0", float(args.k0))
     final_summary.insert(0, "timesteps", float(args.timesteps))
