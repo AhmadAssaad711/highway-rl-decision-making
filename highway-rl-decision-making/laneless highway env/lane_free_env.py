@@ -71,6 +71,7 @@ class LaneFreeVehicleState:
     length: float
     width: float
     desired_speed: float
+    driver_profile: str = "normal"
 
 
 class LaneFreeVehicle:
@@ -93,6 +94,7 @@ class LaneFreeVehicle:
         self.WIDTH = self.width
         self.diagonal = float(np.sqrt(self.length**2 + self.width**2))
         self.desired_speed = float(state.desired_speed)
+        self.driver_profile = str(state.driver_profile)
         self.is_ego = bool(is_ego)
 
         self.lane_index = None
@@ -154,6 +156,7 @@ class LaneFreeVehicle:
             length=float(vehicle.length),
             width=float(vehicle.width),
             desired_speed=float(vehicle.desired_speed),
+            driver_profile=str(getattr(vehicle, "driver_profile", "normal")),
         )
         copy = cls(vehicle.road, state, is_ego=vehicle.is_ego)
         copy.crashed = vehicle.crashed
@@ -189,6 +192,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 "terminate_on_collision": True,
                 "gamma_nudge": 0.0,
                 "ego_controlled": True,
+                "traffic_model": "force",
                 "neighbors_count": 5,
                 "ego_dimensions": cls.EGO_DIMENSIONS.tolist(),
                 "vehicle_dimensions": cls.VEHICLE_DIMENSIONS.tolist(),
@@ -207,6 +211,51 @@ class LaneFreeTrafficEnv(AbstractEnv):
                     "sigma_y": 1.0,
                     "T_x": 1.2,
                     "T_y": 0.8,
+                },
+                "mtm": {
+                    "theta": 0.2,
+                    "s_y0": 0.15,
+                    "tilde_s_y0": 0.30,
+                    "tau": 1.0,
+                    "lambda": 0.4,
+                    "lambda_delta_vy": 0.7,
+                    "p": 0.2,
+                    "a_max": 1.4,
+                    "comfortable_decel": 2.0,
+                    "time_gap": 1.2,
+                    "min_gap": 2.0,
+                    "leader_range": 80.0,
+                    "profile_probabilities": {
+                        "normal": 0.70,
+                        "aggressive": 0.15,
+                        "cautious": 0.15,
+                    },
+                    "profiles": {
+                        "normal": {
+                            "lambda": 0.4,
+                            "tau": 1.0,
+                            "p": 0.2,
+                            "theta": 0.2,
+                            "desired_speed_multiplier": 1.0,
+                            "min_gap_multiplier": 1.0,
+                        },
+                        "aggressive": {
+                            "lambda": 0.6,
+                            "tau": 0.7,
+                            "p": 0.0,
+                            "theta": 0.25,
+                            "desired_speed_multiplier": 1.15,
+                            "min_gap_multiplier": 0.7,
+                        },
+                        "cautious": {
+                            "lambda": 0.28,
+                            "tau": 1.4,
+                            "p": 0.5,
+                            "theta": 0.16,
+                            "desired_speed_multiplier": 0.9,
+                            "min_gap_multiplier": 1.3,
+                        },
+                    },
                 },
                 "bounds": {
                     "ax_min": -6.0,
@@ -263,6 +312,8 @@ class LaneFreeTrafficEnv(AbstractEnv):
         self._cumulative_collision_count = 0
         self._active_collision_pairs: set[tuple[int, int]] = set()
         self._flow_count = 0
+        self._last_mtm_diagnostics: dict[str, float] = {}
+        self._mtm_profile_counts: dict[str, int] = {}
         self._reset()
         obs = self._observe()
         return obs, self._info(obs, self._last_action)
@@ -285,10 +336,12 @@ class LaneFreeTrafficEnv(AbstractEnv):
         road_width = float(self.config["road_width"])
         desired_low, desired_high = self.config["desired_speed_range"]
         speed_low, speed_high = self.config["initial_speed_fraction_range"]
+        mtm_profiles = self.config.get("mtm", {}).get("profiles", {})
 
         x_slots = np.linspace(0.0, road_length, count, endpoint=False)
         self.np_random.shuffle(x_slots)
         vehicles: list[LaneFreeVehicle] = []
+        profile_counts: dict[str, int] = {}
 
         vehicle_dimensions = np.asarray(self.config.get("vehicle_dimensions", self.VEHICLE_DIMENSIONS), dtype=float)
         ego_length, ego_width = np.asarray(self.config.get("ego_dimensions", self.EGO_DIMENSIONS), dtype=float)
@@ -300,7 +353,10 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 vehicle_length, vehicle_width = vehicle_dimensions[
                     self.np_random.integers(0, len(vehicle_dimensions))
                 ]
-            desired_speed = float(self.np_random.uniform(desired_low, desired_high))
+            driver_profile = "ego" if index == 0 else self._sample_mtm_profile()
+            profile = mtm_profiles.get(driver_profile, {}) if isinstance(mtm_profiles, dict) else {}
+            desired_multiplier = float(profile.get("desired_speed_multiplier", 1.0)) if index != 0 else 1.0
+            desired_speed = float(self.np_random.uniform(desired_low, desired_high)) * desired_multiplier
             speed_fraction = float(self.np_random.uniform(speed_low, speed_high))
             x = float((x_slots[index] + self.np_random.uniform(-0.35, 0.35) * road_length / count) % road_length)
             y = float(self.np_random.uniform(vehicle_width / 2.0, road_width - vehicle_width / 2.0))
@@ -312,12 +368,28 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 length=float(vehicle_length),
                 width=float(vehicle_width),
                 desired_speed=desired_speed,
+                driver_profile=driver_profile,
             )
             vehicles.append(LaneFreeVehicle(self.road, state, is_ego=index == 0))
+            profile_counts[driver_profile] = profile_counts.get(driver_profile, 0) + 1
 
         self.road.vehicles = vehicles
         self.vehicle = vehicles[0]
         self.controlled_vehicles = [self.vehicle]
+        self._mtm_profile_counts = profile_counts
+
+    def _sample_mtm_profile(self) -> str:
+        mtm_config = self.config.get("mtm", {})
+        probabilities = mtm_config.get("profile_probabilities", {"normal": 1.0})
+        if not isinstance(probabilities, dict) or not probabilities:
+            return "normal"
+        names = list(probabilities.keys())
+        weights = np.asarray([max(float(probabilities[name]), 0.0) for name in names], dtype=float)
+        total = float(weights.sum())
+        if total <= 0.0:
+            return names[0]
+        weights /= total
+        return str(self.np_random.choice(names, p=weights))
 
     def step(self, action: np.ndarray | list[float] | None) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         action_array = np.zeros(2, dtype=np.float32) if action is None else np.asarray(action, dtype=np.float32)
@@ -360,9 +432,16 @@ class LaneFreeTrafficEnv(AbstractEnv):
         return low + 0.5 * (value + 1.0) * (high - low)
 
     def _compute_accelerations(self) -> np.ndarray:
+        traffic_model = str(self.config.get("traffic_model", "force")).strip().lower()
+        if traffic_model == "mtm":
+            return self._compute_mtm_accelerations()
+        return self._compute_force_accelerations()
+
+    def _compute_force_accelerations(self) -> np.ndarray:
         vehicles = self.road.vehicles
         force = self.config["force"]
         accelerations = np.zeros((len(vehicles), 2), dtype=float)
+        self._last_mtm_diagnostics = {}
 
         for i, vehicle in enumerate(vehicles):
             accelerations[i, 0] += float(force["k_target_x"]) * np.tanh(
@@ -409,6 +488,173 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 accelerations[j, 1] += gamma_nudge * k_nudge * blocked * potential * uy
 
         return accelerations
+
+    def _compute_mtm_accelerations(self) -> np.ndarray:
+        vehicles = self.road.vehicles
+        accelerations = np.zeros((len(vehicles), 2), dtype=float)
+        desired_vy_values: list[float] = []
+        active_leaders = 0
+        leader_distances: list[float] = []
+
+        for i, vehicle in enumerate(vehicles):
+            if vehicle.is_ego and bool(self.config["ego_controlled"]):
+                accelerations[i, 1] = self._boundary_force(vehicle)
+                continue
+
+            ax, ay, diagnostics = self._mtm_controller(vehicle, vehicles)
+            accelerations[i, 0] = ax
+            accelerations[i, 1] = ay
+            desired_vy_values.append(float(diagnostics["desired_vy"]))
+            active_leaders += int(bool(diagnostics["has_leader"]))
+            if bool(diagnostics["has_leader"]):
+                leader_distances.append(float(diagnostics["leader_gap"]))
+
+        non_ego_count = max(len([vehicle for vehicle in vehicles if not vehicle.is_ego]), 1)
+        non_ego_vy = [abs(float(vehicle.vy)) for vehicle in vehicles if not vehicle.is_ego]
+        self._last_mtm_diagnostics = {
+            "active_leader_rate": float(active_leaders / non_ego_count),
+            "mean_abs_vy": float(np.mean(non_ego_vy)) if non_ego_vy else 0.0,
+            "mean_abs_desired_vy": float(np.mean(np.abs(desired_vy_values))) if desired_vy_values else 0.0,
+            "mean_leader_gap": float(np.mean(leader_distances)) if leader_distances else 0.0,
+            "max_abs_desired_vy": float(np.max(np.abs(desired_vy_values))) if desired_vy_values else 0.0,
+        }
+        return accelerations
+
+    def _mtm_controller(self, vehicle: LaneFreeVehicle, vehicles: list[LaneFreeVehicle]) -> tuple[float, float, dict[str, float]]:
+        params = self._mtm_params_for_vehicle(vehicle)
+        free_accel = self._mtm_free_acceleration(vehicle, params)
+        strongest_traffic = 0.0
+        desired_vy = 0.0
+        best_abs_traffic = -np.inf
+        best_gap = 0.0
+        has_leader = False
+        leader_range = float(params["leader_range"])
+
+        for other in vehicles:
+            if other is vehicle:
+                continue
+            dx = self._forward_distance(vehicle.position[0], other.position[0])
+            if not (0.0 < dx < leader_range):
+                continue
+
+            gap_x = max(dx - 0.5 * (vehicle.length + other.length), 0.05)
+            dy = float(other.position[1] - vehicle.position[1])
+            lateral_gap = self._mtm_lateral_gap(vehicle, other, params, theta_key="theta")
+            alpha = min(float(np.exp(-lateral_gap / max(float(params["s_y0"]), 1e-6))), 1.0)
+            alpha_tilde = min(float(np.exp(-lateral_gap / max(float(params["tilde_s_y0"]), 1e-6))), 1.0)
+            if alpha <= 1e-6 and alpha_tilde <= 1e-6:
+                continue
+
+            car_following = self._mtm_car_following_acceleration(vehicle, other, gap_x, params)
+            interaction = car_following - free_accel
+            traffic = alpha * interaction
+            if abs(traffic) > best_abs_traffic:
+                strongest_traffic = traffic
+                best_abs_traffic = abs(traffic)
+                best_gap = gap_x
+                has_leader = True
+
+            obstruction = max(-interaction, 0.0)
+            if obstruction <= 0.0:
+                continue
+            away_direction = self._mtm_away_direction(vehicle, other, dy)
+            relative_lateral_factor = 1.0 - float(params["lambda_delta_vy"]) * (other.vy - vehicle.vy) * np.sign(dy)
+            relative_lateral_factor = float(np.clip(relative_lateral_factor, 0.0, 2.5))
+            politeness_scale = float(np.clip(1.0 - 0.25 * float(params["p"]), 0.5, 1.2))
+            desired_vy += (
+                float(params["lambda"])
+                * politeness_scale
+                * alpha_tilde
+                * obstruction
+                * away_direction
+                * relative_lateral_factor
+            )
+
+        ax = free_accel + strongest_traffic
+        ay = (desired_vy - float(vehicle.vy)) / max(float(params["tau"]), 1e-6) + self._boundary_force(vehicle)
+        return (
+            float(ax),
+            float(ay),
+            {
+                "desired_vy": float(desired_vy),
+                "has_leader": float(has_leader),
+                "leader_gap": float(best_gap),
+                "free_accel": float(free_accel),
+                "traffic_accel": float(strongest_traffic),
+            },
+        )
+
+    def _mtm_params_for_vehicle(self, vehicle: LaneFreeVehicle) -> dict[str, float]:
+        mtm_config = self.config.get("mtm", {})
+        profile_name = str(getattr(vehicle, "driver_profile", "normal"))
+        profiles = mtm_config.get("profiles", {}) if isinstance(mtm_config, dict) else {}
+        profile = profiles.get(profile_name, {}) if isinstance(profiles, dict) else {}
+        params = {
+            "theta": float(mtm_config.get("theta", 0.2)),
+            "s_y0": float(mtm_config.get("s_y0", 0.15)),
+            "tilde_s_y0": float(mtm_config.get("tilde_s_y0", 0.30)),
+            "tau": float(mtm_config.get("tau", 1.0)),
+            "lambda": float(mtm_config.get("lambda", 0.4)),
+            "lambda_delta_vy": float(mtm_config.get("lambda_delta_vy", 0.7)),
+            "p": float(mtm_config.get("p", 0.2)),
+            "a_max": float(mtm_config.get("a_max", 1.4)),
+            "comfortable_decel": float(mtm_config.get("comfortable_decel", 2.0)),
+            "time_gap": float(mtm_config.get("time_gap", 1.2)),
+            "min_gap": float(mtm_config.get("min_gap", 2.0)),
+            "leader_range": float(mtm_config.get("leader_range", self.config["sensing_range"])),
+        }
+        for key in ["theta", "s_y0", "tilde_s_y0", "tau", "lambda", "lambda_delta_vy", "p", "a_max", "comfortable_decel", "time_gap"]:
+            if key in profile:
+                params[key] = float(profile[key])
+        if "min_gap" in profile:
+            params["min_gap"] = float(profile["min_gap"])
+        elif "min_gap_multiplier" in profile:
+            params["min_gap"] *= float(profile["min_gap_multiplier"])
+        return params
+
+    def _mtm_free_acceleration(self, vehicle: LaneFreeVehicle, params: dict[str, float]) -> float:
+        desired_speed = max(float(vehicle.desired_speed), 1e-6)
+        speed_ratio = max(float(vehicle.vx), 0.0) / desired_speed
+        return float(params["a_max"] * (1.0 - speed_ratio**4))
+
+    def _mtm_car_following_acceleration(
+        self,
+        vehicle: LaneFreeVehicle,
+        leader: LaneFreeVehicle,
+        gap_x: float,
+        params: dict[str, float],
+    ) -> float:
+        desired_speed = max(float(vehicle.desired_speed), 1e-6)
+        a_max = max(float(params["a_max"]), 1e-6)
+        comfortable_decel = max(float(params["comfortable_decel"]), 1e-6)
+        delta_v = float(vehicle.vx - leader.vx)
+        dynamic_gap = vehicle.vx * float(params["time_gap"]) + (
+            vehicle.vx * delta_v / (2.0 * np.sqrt(a_max * comfortable_decel))
+        )
+        desired_gap = float(params["min_gap"]) + max(0.0, dynamic_gap)
+        speed_term = (max(float(vehicle.vx), 0.0) / desired_speed) ** 4
+        gap_term = (desired_gap / max(float(gap_x), 0.05)) ** 2
+        return float(a_max * (1.0 - speed_term - gap_term))
+
+    def _mtm_lateral_gap(
+        self,
+        vehicle: LaneFreeVehicle,
+        other: LaneFreeVehicle,
+        params: dict[str, float],
+        *,
+        theta_key: str,
+    ) -> float:
+        dy = abs(float(other.position[1] - vehicle.position[1]))
+        lateral_body = float(params[theta_key]) * 0.5 * (vehicle.width + other.width)
+        return float(max(dy - lateral_body, 0.0))
+
+    def _mtm_away_direction(self, vehicle: LaneFreeVehicle, other: LaneFreeVehicle, dy: float) -> float:
+        if abs(dy) > 1e-6:
+            return float(-np.sign(dy))
+        road_width = float(self.config["road_width"])
+        if vehicle.position[1] <= 0.5 * road_width:
+            return 1.0
+        return -1.0
 
     def _boundary_force(self, vehicle: LaneFreeVehicle) -> float:
         road_width = float(self.config["road_width"])
@@ -532,7 +778,8 @@ class LaneFreeTrafficEnv(AbstractEnv):
 
     def _info(self, obs: np.ndarray, action: np.ndarray | None = None) -> dict[str, Any]:
         elapsed_hours = max(self.time / 3600.0, 1e-9)
-        return {
+        info = {
+            "traffic_model": str(self.config.get("traffic_model", "force")),
             "speed": float(self.vehicle.vx),
             "mean_speed": self.mean_speed,
             "collisions": int(self._last_collision_count),
@@ -544,6 +791,20 @@ class LaneFreeTrafficEnv(AbstractEnv):
             "flow_count": int(self._flow_count),
             "flow_per_hour": float(self._flow_count / elapsed_hours),
         }
+        if str(self.config.get("traffic_model", "force")).strip().lower() == "mtm":
+            diagnostics = self._last_mtm_diagnostics or {}
+            info.update(
+                {
+                    "mtm_active_leader_rate": float(diagnostics.get("active_leader_rate", 0.0)),
+                    "mtm_mean_abs_vy": float(diagnostics.get("mean_abs_vy", 0.0)),
+                    "mtm_mean_abs_desired_vy": float(diagnostics.get("mean_abs_desired_vy", 0.0)),
+                    "mtm_max_abs_desired_vy": float(diagnostics.get("max_abs_desired_vy", 0.0)),
+                    "mtm_mean_leader_gap": float(diagnostics.get("mean_leader_gap", 0.0)),
+                }
+            )
+            for profile_name, count in self._mtm_profile_counts.items():
+                info[f"mtm_profile_count_{profile_name}"] = int(count)
+        return info
 
     @property
     def mean_speed(self) -> float:

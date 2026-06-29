@@ -32,6 +32,7 @@ from cbf_lambda_event_bc_pilot_sweep import (
     summarize,
 )
 from guided_cbf_minimal import install_minimal_guided_cbf
+from laneless_script_config import active_traffic_model, add_env_config_args, env_config_from_args
 
 
 warnings.filterwarnings("ignore", message="OSQP exited.*")
@@ -250,6 +251,9 @@ def install_safety_observation_env(namespace: dict[str, Any]) -> None:
         use_safety_obs: bool,
         n_envs: int,
         use_subproc: bool = False,
+        env_config: dict[str, Any] | None = None,
+        reward_config: dict[str, float] | None = None,
+        normalize_observation: bool | None = None,
     ):
         def _single_env(env_seed: int) -> gym.Env:
             return make_safety_obs_event_cbf_single_env(
@@ -261,6 +265,9 @@ def install_safety_observation_env(namespace: dict[str, Any]) -> None:
                 k1=k1,
                 eps_side=eps_side,
                 use_safety_obs=use_safety_obs,
+                env_config=env_config,
+                reward_config=reward_config,
+                normalize_observation=normalize_observation,
             )
 
         return namespace["_make_vectorized_env"](
@@ -293,6 +300,7 @@ def evaluate_variant(
     k1: float,
     eps_side: float,
     event_threshold: float,
+    env_config: dict[str, Any] | None = None,
     collect_steps: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     episode_rows: list[dict[str, float]] = []
@@ -307,6 +315,7 @@ def evaluate_variant(
             k1=k1,
             eps_side=eps_side,
             use_safety_obs=use_safety_obs,
+            env_config=env_config,
         )
         namespace["configure_paper_evaluation_env"](env, steps=namespace["PAPER_EVAL_STEPS"])
         obs, _ = env.reset(seed=seed + episode)
@@ -425,6 +434,7 @@ class SafetyObsEvalCallback(BaseCallback):
         k0: float,
         k1: float,
         eps_side: float,
+        env_config: dict[str, Any] | None,
         eval_freq: int,
         episodes: int,
         seed: int,
@@ -440,6 +450,7 @@ class SafetyObsEvalCallback(BaseCallback):
         self.k0 = float(k0)
         self.k1 = float(k1)
         self.eps_side = float(eps_side)
+        self.env_config = env_config
         self.eval_freq = int(eval_freq)
         self.episodes = int(episodes)
         self.seed = int(seed)
@@ -461,6 +472,7 @@ class SafetyObsEvalCallback(BaseCallback):
             k1=self.k1,
             eps_side=self.eps_side,
             event_threshold=self.event_threshold,
+            env_config=self.env_config,
             collect_steps=False,
         )
         row: dict[str, float | str | bool] = {
@@ -543,6 +555,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=711_000)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--n-envs", type=int, default=1)
+    add_env_config_args(parser)
     parser.add_argument("--project-root", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--no-resume", action="store_true")
@@ -562,8 +575,11 @@ def main() -> int:
     install_minimal_guided_cbf(namespace)
     install_event_penalty_env(namespace)
     install_safety_observation_env(namespace)
+    env_config = env_config_from_args(args, namespace["ENV_CONFIG"])
+    traffic_model = active_traffic_model(env_config)
 
-    output_dir = args.output_dir or (Path(namespace["ARTIFACT_DIR"]) / "cbf_safety_obs_experiment")
+    default_output_name = "cbf_safety_obs_experiment_mtm" if traffic_model == "mtm" else "cbf_safety_obs_experiment"
+    output_dir = args.output_dir or (Path(namespace["ARTIFACT_DIR"]) / default_output_name)
     output_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(DEFAULT_VARIANTS).to_csv(output_dir / "variant_configs.csv", index=False)
     (output_dir / "safety_feature_names.json").write_text(
@@ -578,6 +594,7 @@ def main() -> int:
             "timesteps": args.timesteps,
             "final_eval_episodes": args.final_eval_episodes,
             "event_threshold": args.event_threshold,
+            "traffic_model": traffic_model,
             "k0": args.k0,
             "k1": args.k1,
             "eps_side": args.eps_side,
@@ -630,6 +647,7 @@ def main() -> int:
             use_safety_obs=use_safety_obs,
             n_envs=args.n_envs,
             use_subproc=False,
+            env_config=env_config,
         )
         n_actions = train_env.action_space.shape[-1]
         action_noise = namespace["make_ou_action_noise"](n_actions, n_envs=args.n_envs)
@@ -691,6 +709,7 @@ def main() -> int:
                     k1=args.k1,
                     eps_side=args.eps_side,
                     event_threshold=args.event_threshold,
+                    env_config=env_config,
                     collect_steps=False,
                 )
                 row: dict[str, float | str | bool] = {
@@ -738,6 +757,7 @@ def main() -> int:
             k1=args.k1,
             eps_side=args.eps_side,
             event_threshold=args.event_threshold,
+            env_config=env_config,
             collect_steps=True,
         )
         final_metrics.to_csv(final_episodes_path, index=False)
@@ -753,6 +773,7 @@ def main() -> int:
             "k1": float(args.k1),
             "eps_side": float(args.eps_side),
             "event_threshold": float(args.event_threshold),
+            "traffic_model": traffic_model,
             "lambda_norm": lambda_norm,
             "lambda_event": lambda_event,
             "lambda_bc": lambda_bc,

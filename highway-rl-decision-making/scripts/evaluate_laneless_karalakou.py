@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from laneless_script_config import active_traffic_model, env_config_from_args
+
 
 def set_stable_native_defaults() -> None:
     for key in [
@@ -47,7 +49,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--project-root", type=Path, default=None)
+    parser.add_argument("--traffic-model", choices=["force", "mtm"], default=None)
+    parser.add_argument("--env-config-json", default=None)
+    parser.add_argument("--env-config-file", type=Path, default=None)
     return parser.parse_args()
+
+
+def with_stem_suffix(path: Path, suffix: str) -> Path:
+    return path.with_name(f"{path.stem}_{suffix}{path.suffix}")
 
 
 def main() -> int:
@@ -64,11 +73,15 @@ def main() -> int:
     exec_notebook_cells(notebook_path, base_cells + (cbf_cells if args.variant == "ddpg-cbf" else []), namespace)
 
     namespace["DEVICE"] = args.device
+    namespace["ENV_CONFIG"] = env_config_from_args(args, namespace["ENV_CONFIG"])
+    traffic_model = active_traffic_model(namespace["ENV_CONFIG"])
     output_path = args.output
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if args.variant == "ppo":
         model_path = namespace["MODEL_PATH"]
+        if traffic_model != "force":
+            model_path = with_stem_suffix(Path(model_path), f"traffic_{traffic_model}")
         print(f"[eval-runner] loading {model_path}", flush=True)
         model = namespace["PPO"].load(str(model_path), device=args.device)
         print("[eval-runner] evaluating PPO", flush=True)
@@ -77,9 +90,12 @@ def main() -> int:
             episodes=args.episodes,
             seed=args.seed,
             deterministic=True,
+            env_config=namespace["ENV_CONFIG"],
         )
     elif args.variant == "ddpg":
         model_path = namespace["DDPG_MODEL_PATH"]
+        if traffic_model != "force":
+            model_path = with_stem_suffix(Path(model_path), f"traffic_{traffic_model}")
         print(f"[eval-runner] loading {model_path}", flush=True)
         model = namespace["DDPG"].load(str(model_path), device=args.device)
         print("[eval-runner] evaluating DDPG", flush=True)
@@ -88,9 +104,12 @@ def main() -> int:
             episodes=args.episodes,
             seed=args.seed,
             deterministic=True,
+            env_config=namespace["ENV_CONFIG"],
         )
     else:
         model_path = namespace["DDPG_CBF_MODEL_PATH"]
+        if traffic_model != "force":
+            model_path = with_stem_suffix(Path(model_path), f"traffic_{traffic_model}")
         print(f"[eval-runner] loading {model_path}", flush=True)
         model = namespace["DDPG"].load(str(model_path), device=args.device)
         print("[eval-runner] evaluating DDPG-CBF", flush=True)
@@ -100,6 +119,7 @@ def main() -> int:
             seed=args.seed,
             deterministic=True,
             lambda_filter=namespace["CBF_FILTER_REWARD_LAMBDA"],
+            env_config=namespace["ENV_CONFIG"],
         )
 
     metrics.to_csv(output_path, index=False)

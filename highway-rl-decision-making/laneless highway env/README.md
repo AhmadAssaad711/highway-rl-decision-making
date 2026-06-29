@@ -85,6 +85,34 @@ The observation is a `(1 + neighbors_count, 7)` normalized array with rows:
 
 The first row is ego. Neighbor `dx` is the signed wrapped distance relative to ego.
 
+## MTM Surrounding Traffic
+
+The same `lane-free-v0` environment can keep the current force-based traffic model
+or switch non-ego vehicles to a Kanagaraj-Treiber-style MTM model:
+
+```python
+env = gym.make(
+    "lane-free-v0",
+    config={
+        "traffic_model": "mtm",
+        "vehicles_count": 35,
+    },
+)
+```
+
+The ego vehicle is still controlled by the RL action. Existing CBF wrappers still
+filter only ego acceleration. MTM is used only for surrounding vehicles, with the
+ego included as a neighbor so traffic can react to it.
+
+Available built-in driver profiles are `normal`, `aggressive`, and `cautious`.
+Their probabilities and parameters live under the `mtm` config block.
+
+Quick force-vs-MTM smoke comparison:
+
+```powershell
+python "..\scripts\mtm_laneless_smoke.py"
+```
+
 ## Demo
 
 Saved plot comparison:

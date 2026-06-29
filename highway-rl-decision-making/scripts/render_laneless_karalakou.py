@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from laneless_script_config import active_traffic_model, env_config_from_args
+
 
 def set_stable_native_defaults() -> None:
     for key in [
@@ -47,7 +49,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--project-root", type=Path, default=None)
     parser.add_argument("--model-path", type=Path, default=None)
+    parser.add_argument("--traffic-model", choices=["force", "mtm"], default=None)
+    parser.add_argument("--env-config-json", default=None)
+    parser.add_argument("--env-config-file", type=Path, default=None)
     return parser.parse_args()
+
+
+def with_stem_suffix(path: Path, suffix: str) -> Path:
+    return path.with_name(f"{path.stem}_{suffix}{path.suffix}")
 
 
 def main() -> int:
@@ -62,22 +71,31 @@ def main() -> int:
     cbf_cells = [31, 33, 35, 37, 39, 41]
     exec_notebook_cells(notebook_path, base_cells + (cbf_cells if args.variant == "ddpg-cbf" else []), namespace)
     namespace["DEVICE"] = args.device
+    namespace["ENV_CONFIG"] = env_config_from_args(args, namespace["ENV_CONFIG"])
+    traffic_model = active_traffic_model(namespace["ENV_CONFIG"])
 
     if args.variant == "ppo":
         model_path = args.model_path or namespace["MODEL_PATH"]
+        if args.model_path is None and traffic_model != "force":
+            model_path = with_stem_suffix(Path(model_path), f"traffic_{traffic_model}")
         model = namespace["PPO"].load(str(model_path), device=args.device)
-        env = namespace["make_single_env"](seed=args.seed, render_mode="human")
+        env = namespace["make_single_env"](seed=args.seed, render_mode="human", env_config=namespace["ENV_CONFIG"])
     elif args.variant == "ddpg":
         model_path = args.model_path or namespace["DDPG_MODEL_PATH"]
+        if args.model_path is None and traffic_model != "force":
+            model_path = with_stem_suffix(Path(model_path), f"traffic_{traffic_model}")
         model = namespace["DDPG"].load(str(model_path), device=args.device)
-        env = namespace["make_single_env"](seed=args.seed, render_mode="human")
+        env = namespace["make_single_env"](seed=args.seed, render_mode="human", env_config=namespace["ENV_CONFIG"])
     else:
         model_path = args.model_path or namespace["DDPG_CBF_MODEL_PATH"]
+        if args.model_path is None and traffic_model != "force":
+            model_path = with_stem_suffix(Path(model_path), f"traffic_{traffic_model}")
         model = namespace["DDPG"].load(str(model_path), device=args.device)
         env = namespace["make_cbf_single_env"](
             seed=args.seed,
             render_mode="human",
             lambda_filter=namespace["CBF_FILTER_REWARD_LAMBDA"],
+            env_config=namespace["ENV_CONFIG"],
         )
 
     print(f"[render-runner] loaded {model_path}", flush=True)

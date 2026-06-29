@@ -21,6 +21,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 
 from guided_cbf_minimal import install_minimal_guided_cbf
+from laneless_script_config import active_traffic_model, add_env_config_args, env_config_from_args
 
 
 warnings.filterwarnings("ignore", message="OSQP exited.*")
@@ -169,6 +170,9 @@ def install_event_penalty_env(namespace: dict[str, Any]) -> None:
         eps_side: float,
         n_envs: int,
         use_subproc: bool = False,
+        env_config: dict[str, Any] | None = None,
+        reward_config: dict[str, float] | None = None,
+        normalize_observation: bool | None = None,
     ):
         def _single_env(env_seed: int) -> gym.Env:
             return make_event_cbf_single_env(
@@ -179,6 +183,9 @@ def install_event_penalty_env(namespace: dict[str, Any]) -> None:
                 k0=k0,
                 k1=k1,
                 eps_side=eps_side,
+                env_config=env_config,
+                reward_config=reward_config,
+                normalize_observation=normalize_observation,
             )
 
         return namespace["_make_vectorized_env"](
@@ -208,6 +215,8 @@ def evaluate_model(
     k1: float,
     eps_side: float,
     event_threshold: float,
+    env_config: dict[str, Any] | None = None,
+    reward_config: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, float]] = []
     for episode in range(episodes):
@@ -219,6 +228,8 @@ def evaluate_model(
             k0=k0,
             k1=k1,
             eps_side=eps_side,
+            env_config=env_config,
+            reward_config=reward_config,
         )
         namespace["configure_paper_evaluation_env"](env, steps=namespace["PAPER_EVAL_STEPS"])
         obs, _ = env.reset(seed=seed + episode)
@@ -337,6 +348,8 @@ class PilotEvalCallback(BaseCallback):
         k0: float,
         k1: float,
         eps_side: float,
+        env_config: dict[str, Any] | None,
+        reward_config: dict[str, float] | None,
         eval_freq: int,
         episodes: int,
         seed: int,
@@ -351,6 +364,8 @@ class PilotEvalCallback(BaseCallback):
         self.k0 = float(k0)
         self.k1 = float(k1)
         self.eps_side = float(eps_side)
+        self.env_config = env_config
+        self.reward_config = reward_config
         self.eval_freq = int(eval_freq)
         self.episodes = int(episodes)
         self.seed = int(seed)
@@ -370,6 +385,8 @@ class PilotEvalCallback(BaseCallback):
             k1=self.k1,
             eps_side=self.eps_side,
             event_threshold=self.event_threshold,
+            env_config=self.env_config,
+            reward_config=self.reward_config,
         )
         row: dict[str, float | str] = {
             "trial_name": self.trial_name,
@@ -478,6 +495,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=511_000)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--n-envs", type=int, default=1)
+    add_env_config_args(parser)
     parser.add_argument("--project-root", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--no-resume", action="store_true")
@@ -496,8 +514,11 @@ def main() -> int:
     namespace["DEVICE"] = args.device
     install_minimal_guided_cbf(namespace)
     install_event_penalty_env(namespace)
+    env_config = env_config_from_args(args, namespace["ENV_CONFIG"])
+    traffic_model = active_traffic_model(env_config)
 
-    output_dir = args.output_dir or (Path(namespace["ARTIFACT_DIR"]) / "cbf_lambda_event_bc_pilot")
+    default_output_name = "cbf_lambda_event_bc_pilot_mtm" if traffic_model == "mtm" else "cbf_lambda_event_bc_pilot"
+    output_dir = args.output_dir or (Path(namespace["ARTIFACT_DIR"]) / default_output_name)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "trial_configs.csv").write_text(pd.DataFrame(trial_config_rows()).to_csv(index=False), encoding="utf-8")
 
@@ -508,6 +529,7 @@ def main() -> int:
             "timesteps": args.timesteps,
             "final_eval_episodes": args.final_eval_episodes,
             "event_threshold": args.event_threshold,
+            "traffic_model": traffic_model,
             "k0": args.k0,
             "k1": args.k1,
             "eps_side": args.eps_side,
@@ -548,6 +570,7 @@ def main() -> int:
             eps_side=args.eps_side,
             n_envs=args.n_envs,
             use_subproc=False,
+            env_config=env_config,
         )
         n_actions = train_env.action_space.shape[-1]
         action_noise = namespace["make_ou_action_noise"](n_actions, n_envs=args.n_envs)
@@ -561,6 +584,8 @@ def main() -> int:
             k0=args.k0,
             k1=args.k1,
             eps_side=args.eps_side,
+            env_config=env_config,
+            reward_config=None,
             eval_freq=args.train_eval_freq,
             episodes=args.train_eval_episodes,
             seed=args.seed + index * 10_000,
@@ -610,6 +635,8 @@ def main() -> int:
             k1=args.k1,
             eps_side=args.eps_side,
             event_threshold=args.event_threshold,
+            env_config=env_config,
+            reward_config=None,
         )
         final_metrics.to_csv(final_episodes_path, index=False)
         summary = {
@@ -621,6 +648,7 @@ def main() -> int:
             "k1": float(args.k1),
             "eps_side": float(args.eps_side),
             "event_threshold": float(args.event_threshold),
+            "traffic_model": traffic_model,
             "lambda_norm": float(lambda_norm),
             "lambda_event": float(lambda_event),
             "lambda_bc": float(lambda_bc),
@@ -661,6 +689,7 @@ def main() -> int:
             "lambda_norm",
             "lambda_event",
             "lambda_bc",
+            "traffic_model",
             "return_mean",
             "mean_abs_speed_error",
             "event_intervention_rate",

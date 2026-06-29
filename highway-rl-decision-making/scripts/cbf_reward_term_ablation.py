@@ -26,6 +26,7 @@ from cbf_lambda_event_bc_pilot_sweep import (
     install_event_penalty_env,
     set_stable_native_defaults,
 )
+from laneless_script_config import active_traffic_model, add_env_config_args, env_config_from_args
 
 
 warnings.filterwarnings("ignore", message="OSQP exited.*")
@@ -223,6 +224,7 @@ def make_single_env(
     *,
     seed: int,
     reward_config: dict[str, float],
+    env_config: dict[str, Any],
     lambda_norm: float,
     lambda_event: float,
     event_threshold: float,
@@ -232,7 +234,7 @@ def make_single_env(
     render_mode: str | None = None,
     normalize_observation: bool | None = None,
 ) -> gym.Env:
-    env = gym.make("lane-free-v0", render_mode=render_mode, config=namespace["ENV_CONFIG"])
+    env = gym.make("lane-free-v0", render_mode=render_mode, config=env_config)
     env = namespace["KaralakouRewardWrapper"](env, reward_config=reward_config)
     env = namespace["EventPenaltySafetyFilteredAccelerationWrapper"](
         env,
@@ -256,6 +258,7 @@ def make_training_env(
     *,
     seed: int,
     reward_config: dict[str, float],
+    env_config: dict[str, Any],
     lambda_norm: float,
     lambda_event: float,
     event_threshold: float,
@@ -269,6 +272,7 @@ def make_training_env(
             namespace,
             seed=env_seed,
             reward_config=reward_config,
+            env_config=env_config,
             lambda_norm=lambda_norm,
             lambda_event=lambda_event,
             event_threshold=event_threshold,
@@ -293,6 +297,7 @@ def evaluate_model(
     episodes: int,
     seed: int,
     reward_config: dict[str, float],
+    env_config: dict[str, Any],
     k0: float,
     k1: float,
     eps_side: float,
@@ -304,6 +309,7 @@ def evaluate_model(
             namespace,
             seed=seed + episode,
             reward_config=reward_config,
+            env_config=env_config,
             lambda_norm=0.0,
             lambda_event=0.0,
             event_threshold=event_threshold,
@@ -429,6 +435,7 @@ class RewardAblationEvalCallback(BaseCallback):
         *,
         trial_name: str,
         reward_config: dict[str, float],
+        env_config: dict[str, Any],
         lambda_bc: float,
         event_threshold: float,
         k0: float,
@@ -442,6 +449,7 @@ class RewardAblationEvalCallback(BaseCallback):
         self.namespace = namespace
         self.trial_name = trial_name
         self.reward_config = reward_config
+        self.env_config = env_config
         self.lambda_bc = float(lambda_bc)
         self.event_threshold = float(event_threshold)
         self.k0 = float(k0)
@@ -463,6 +471,7 @@ class RewardAblationEvalCallback(BaseCallback):
             episodes=self.episodes,
             seed=self.seed + self.num_timesteps,
             reward_config=self.reward_config,
+            env_config=self.env_config,
             k0=self.k0,
             k1=self.k1,
             eps_side=self.eps_side,
@@ -555,6 +564,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=623_000)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--n-envs", type=int, default=1)
+    add_env_config_args(parser)
     parser.add_argument("--project-root", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--no-resume", action="store_true")
@@ -575,6 +585,8 @@ def main() -> int:
     namespace["DEVICE"] = args.device
     install_safety_set_reward_wrapper(namespace)
     install_event_penalty_env(namespace)
+    env_config = env_config_from_args(args, namespace["ENV_CONFIG"])
+    traffic_model = active_traffic_model(env_config)
 
     trials = DEFAULT_TRIALS
     if args.smoke:
@@ -584,7 +596,8 @@ def main() -> int:
         args.train_eval_episodes = min(args.train_eval_episodes, 1)
         args.final_eval_episodes = min(args.final_eval_episodes, 2)
 
-    output_dir = args.output_dir or (Path(namespace["ARTIFACT_DIR"]) / "cbf_reward_term_ablation")
+    default_output_name = "cbf_reward_term_ablation_mtm" if traffic_model == "mtm" else "cbf_reward_term_ablation"
+    output_dir = args.output_dir or (Path(namespace["ARTIFACT_DIR"]) / default_output_name)
     output_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(trials).to_csv(output_dir / "trial_configs.csv", index=False)
 
@@ -595,6 +608,7 @@ def main() -> int:
             "timesteps": args.timesteps,
             "lambda_norm": args.lambda_norm,
             "lambda_event": args.lambda_event,
+            "traffic_model": traffic_model,
             "k0": args.k0,
             "k1": args.k1,
             "eps_side": args.eps_side,
@@ -634,6 +648,7 @@ def main() -> int:
             namespace,
             seed=args.seed + index * 1_000,
             reward_config=reward_config,
+            env_config=env_config,
             lambda_norm=args.lambda_norm,
             lambda_event=args.lambda_event,
             event_threshold=args.event_threshold,
@@ -648,6 +663,7 @@ def main() -> int:
             namespace,
             trial_name=trial_name,
             reward_config=reward_config,
+            env_config=env_config,
             lambda_bc=lambda_bc,
             event_threshold=args.event_threshold,
             k0=args.k0,
@@ -699,6 +715,7 @@ def main() -> int:
             episodes=args.final_eval_episodes,
             seed=args.seed + index * 100_000,
             reward_config=reward_config,
+            env_config=env_config,
             k0=args.k0,
             k1=args.k1,
             eps_side=args.eps_side,
@@ -714,6 +731,7 @@ def main() -> int:
             "k1": float(args.k1),
             "eps_side": float(args.eps_side),
             "event_threshold": float(args.event_threshold),
+            "traffic_model": traffic_model,
             "lambda_norm": float(args.lambda_norm),
             "lambda_event": float(args.lambda_event),
             "lambda_bc": lambda_bc,

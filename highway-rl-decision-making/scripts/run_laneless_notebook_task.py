@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from guided_cbf_minimal import install_minimal_guided_cbf
+from laneless_script_config import active_traffic_model, env_config_from_args
 from laneless_training_registry import archive_training_outputs, make_run_tag
 
 
@@ -65,6 +66,8 @@ def exec_notebook_cells(notebook_path: Path, cell_indices: list[int], namespace:
 def apply_overrides(namespace: dict[str, Any], args: argparse.Namespace, task: dict[str, Any]) -> None:
     namespace["DEVICE"] = args.device
     namespace[task["flag"]] = True
+    if "ENV_CONFIG" in namespace:
+        namespace["ENV_CONFIG"] = env_config_from_args(args, namespace["ENV_CONFIG"])
 
     if args.timesteps is not None:
         timesteps = int(args.timesteps)
@@ -80,6 +83,34 @@ def apply_overrides(namespace: dict[str, Any], args: argparse.Namespace, task: d
         namespace["CBF_K0"] = float(args.k0)
     if args.k1 is not None:
         namespace["CBF_K1"] = float(args.k1)
+    if args.eps_side is not None:
+        namespace["CBF_EPS_SIDE"] = float(args.eps_side)
+
+
+def _with_stem_suffix(path: Path, suffix: str) -> Path:
+    return path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+
+
+def apply_traffic_artifact_suffix(namespace: dict[str, Any]) -> None:
+    traffic_model = active_traffic_model(namespace.get("ENV_CONFIG", {}))
+    if traffic_model == "force":
+        return
+    suffix = f"traffic_{traffic_model}"
+    for key in [
+        "MODEL_PATH",
+        "HISTORY_PATH",
+        "PLOT_PATH",
+        "DDPG_MODEL_PATH",
+        "DDPG_HISTORY_PATH",
+        "DDPG_PLOT_PATH",
+        "DDPG_CBF_MODEL_PATH",
+        "DDPG_CBF_HISTORY_PATH",
+        "DDPG_CBF_PLOT_PATH",
+        "GUIDED_DDPG_CBF_MODEL_PATH",
+        "GUIDED_DDPG_CBF_HISTORY_PATH",
+    ]:
+        if key in namespace:
+            namespace[key] = _with_stem_suffix(Path(namespace[key]), suffix)
 
 
 TASKS = {
@@ -120,6 +151,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-filter", type=float, default=None)
     parser.add_argument("--k0", type=float, default=None)
     parser.add_argument("--k1", type=float, default=None)
+    parser.add_argument("--eps-side", type=float, default=None)
+    parser.add_argument("--traffic-model", choices=["force", "mtm"], default=None)
+    parser.add_argument("--env-config-json", default=None)
+    parser.add_argument("--env-config-file", type=Path, default=None)
     parser.add_argument("--run-tag", default=None)
     return parser.parse_args()
 
@@ -139,9 +174,10 @@ def main() -> int:
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     for cell_index in task["deps"]:
         exec_notebook_cell(notebook, notebook_path, cell_index, namespace)
-        if cell_index == 33:
+        if cell_index in {6, 33}:
             apply_overrides(namespace, args, task)
     apply_overrides(namespace, args, task)
+    apply_traffic_artifact_suffix(namespace)
 
     print(
         "[notebook-task] starting",
@@ -153,11 +189,14 @@ def main() -> int:
             "lambda_filter": namespace.get("CBF_FILTER_REWARD_LAMBDA"),
             "k0": namespace.get("CBF_K0"),
             "k1": namespace.get("CBF_K1"),
+            "eps_side": namespace.get("CBF_EPS_SIDE"),
+            "traffic_model": active_traffic_model(namespace.get("ENV_CONFIG", {})),
         },
         flush=True,
     )
     if args.task == "guided-ddpg-cbf-train":
         install_minimal_guided_cbf(namespace)
+        apply_traffic_artifact_suffix(namespace)
         exec_notebook_cell_tail(
             notebook,
             notebook_path,
