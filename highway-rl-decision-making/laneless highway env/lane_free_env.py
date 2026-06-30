@@ -78,6 +78,12 @@ class LaneFreeVehicle:
     """A lane-free vehicle compatible with highway-env's vehicle graphics."""
 
     HISTORY_SIZE = 30
+    PROFILE_COLORS = {
+        "normal": (80, 170, 255),
+        "aggressive": (235, 80, 70),
+        "cautious": (245, 195, 65),
+        "ego": (50, 200, 0),
+    }
 
     def __init__(self, road: Road, state: LaneFreeVehicleState, *, is_ego: bool = False) -> None:
         # Do not inherit from highway_env.vehicle.kinematics.Vehicle: its base
@@ -113,7 +119,7 @@ class LaneFreeVehicle:
         self.impact = np.zeros(2, dtype=float)
         self.log = []
         self.history = deque(maxlen=self.HISTORY_SIZE)
-        self.color = (50, 200, 0) if self.is_ego else (100, 200, 255)
+        self.color = self._profile_color()
         self._sync_graphics_fields()
 
     @property
@@ -145,6 +151,10 @@ class LaneFreeVehicle:
         self.WIDTH = self.width
         self.action["acceleration"] = self.ax
         self.action["steering"] = 0.0
+
+    def _profile_color(self) -> tuple[int, int, int]:
+        profile = str(getattr(self, "driver_profile", "normal")).strip().lower()
+        return self.PROFILE_COLORS.get(profile, self.PROFILE_COLORS["normal"])
 
     @classmethod
     def create_from(cls, vehicle: "LaneFreeVehicle") -> "LaneFreeVehicle":
@@ -353,9 +363,10 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 vehicle_length, vehicle_width = vehicle_dimensions[
                     self.np_random.integers(0, len(vehicle_dimensions))
                 ]
-            driver_profile = "ego" if index == 0 else self._sample_mtm_profile()
+            ego_controlled = index == 0 and bool(self.config.get("ego_controlled", True))
+            driver_profile = "ego" if ego_controlled else self._sample_mtm_profile()
             profile = mtm_profiles.get(driver_profile, {}) if isinstance(mtm_profiles, dict) else {}
-            desired_multiplier = float(profile.get("desired_speed_multiplier", 1.0)) if index != 0 else 1.0
+            desired_multiplier = float(profile.get("desired_speed_multiplier", 1.0)) if not ego_controlled else 1.0
             desired_speed = float(self.np_random.uniform(desired_low, desired_high)) * desired_multiplier
             speed_fraction = float(self.np_random.uniform(speed_low, speed_high))
             x = float((x_slots[index] + self.np_random.uniform(-0.35, 0.35) * road_length / count) % road_length)
@@ -509,11 +520,13 @@ class LaneFreeTrafficEnv(AbstractEnv):
             if bool(diagnostics["has_leader"]):
                 leader_distances.append(float(diagnostics["leader_gap"]))
 
-        non_ego_count = max(len([vehicle for vehicle in vehicles if not vehicle.is_ego]), 1)
-        non_ego_vy = [abs(float(vehicle.vy)) for vehicle in vehicles if not vehicle.is_ego]
+        ego_controlled = bool(self.config["ego_controlled"])
+        mtm_driven_vehicles = [vehicle for vehicle in vehicles if not (vehicle.is_ego and ego_controlled)]
+        mtm_vehicle_count = max(len(mtm_driven_vehicles), 1)
+        mtm_vy = [abs(float(vehicle.vy)) for vehicle in mtm_driven_vehicles]
         self._last_mtm_diagnostics = {
-            "active_leader_rate": float(active_leaders / non_ego_count),
-            "mean_abs_vy": float(np.mean(non_ego_vy)) if non_ego_vy else 0.0,
+            "active_leader_rate": float(active_leaders / mtm_vehicle_count),
+            "mean_abs_vy": float(np.mean(mtm_vy)) if mtm_vy else 0.0,
             "mean_abs_desired_vy": float(np.mean(np.abs(desired_vy_values))) if desired_vy_values else 0.0,
             "mean_leader_gap": float(np.mean(leader_distances)) if leader_distances else 0.0,
             "max_abs_desired_vy": float(np.max(np.abs(desired_vy_values))) if desired_vy_values else 0.0,

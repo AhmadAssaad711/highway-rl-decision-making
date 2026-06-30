@@ -250,6 +250,21 @@ def make_scenarios(road_width: float) -> list[ScenarioSpec]:
             ],
         ),
         ScenarioSpec(
+            name="sudden_lead_slowdown",
+            title="Sudden Lead Slowdown: Reactive Safety",
+            expected="React to a sharply slower leader without diving into occupied side gaps.",
+            bands=[(1.9, 4.0, "#dc2626", "occupied lower gap"), (6.7, 9.2, "#f97316", "partly closing upper gap")],
+            vehicles=[
+                ego,
+                VehicleSpec("hard-braking lead", 15.0, center, 8.0, role="blocker", desired_speed=8.0),
+                VehicleSpec("upper closer", -10.0, 8.1, 27.0, role="hazard"),
+                VehicleSpec("upper front", 25.0, 8.0, 18.0, role="hazard"),
+                VehicleSpec("lower side", 8.0, 3.0, 18.5, role="hazard"),
+                VehicleSpec("lower rear", -14.0, 3.1, 23.0, role="hazard"),
+                VehicleSpec("far center", 48.0, center, 18.0, role="traffic"),
+            ],
+        ),
+        ScenarioSpec(
             name="staggered_gap_selection",
             title="Staggered Traffic: Pick The Clean Gap",
             expected="Thread through staggered traffic by avoiding the closer blocked side.",

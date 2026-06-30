@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -91,11 +93,24 @@ def _with_stem_suffix(path: Path, suffix: str) -> Path:
     return path.with_name(f"{path.stem}_{suffix}{path.suffix}")
 
 
-def apply_traffic_artifact_suffix(namespace: dict[str, Any]) -> None:
+def normalize_artifact_suffix(value: str | None) -> str | None:
+    if value is None:
+        return None
+    suffix = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    suffix = suffix.strip("._-")
+    if len(suffix) > 16:
+        digest = hashlib.sha1(suffix.encode("utf-8")).hexdigest()[:8]
+        suffix = f"{suffix[:7].strip('._-')}_{digest}"
+    return suffix or None
+
+
+def apply_traffic_artifact_suffix(namespace: dict[str, Any], artifact_suffix: str | None = None) -> None:
     traffic_model = active_traffic_model(namespace.get("ENV_CONFIG", {}))
-    if traffic_model == "force":
+    suffix = normalize_artifact_suffix(artifact_suffix)
+    if suffix is None and traffic_model != "force":
+        suffix = f"traffic_{traffic_model}"
+    if suffix is None:
         return
-    suffix = f"traffic_{traffic_model}"
     for key in [
         "MODEL_PATH",
         "HISTORY_PATH",
@@ -155,6 +170,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--traffic-model", choices=["force", "mtm"], default=None)
     parser.add_argument("--env-config-json", default=None)
     parser.add_argument("--env-config-file", type=Path, default=None)
+    parser.add_argument("--artifact-suffix", default=None, help="Suffix model/history artifacts for this environment.")
     parser.add_argument("--run-tag", default=None)
     return parser.parse_args()
 
@@ -177,7 +193,7 @@ def main() -> int:
         if cell_index in {6, 33}:
             apply_overrides(namespace, args, task)
     apply_overrides(namespace, args, task)
-    apply_traffic_artifact_suffix(namespace)
+    apply_traffic_artifact_suffix(namespace, args.artifact_suffix)
 
     print(
         "[notebook-task] starting",
@@ -191,12 +207,13 @@ def main() -> int:
             "k1": namespace.get("CBF_K1"),
             "eps_side": namespace.get("CBF_EPS_SIDE"),
             "traffic_model": active_traffic_model(namespace.get("ENV_CONFIG", {})),
+            "artifact_suffix": normalize_artifact_suffix(args.artifact_suffix),
         },
         flush=True,
     )
     if args.task == "guided-ddpg-cbf-train":
         install_minimal_guided_cbf(namespace)
-        apply_traffic_artifact_suffix(namespace)
+        apply_traffic_artifact_suffix(namespace, args.artifact_suffix)
         exec_notebook_cell_tail(
             notebook,
             notebook_path,
