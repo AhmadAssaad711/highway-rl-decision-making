@@ -150,6 +150,14 @@ def make_scenarios(road_width: float) -> list[ScenarioSpec]:
     ego = VehicleSpec("ego", 0.0, center, 20.0, role="ego", length=3.2, width=1.6, desired_speed=20.0)
     return [
         ScenarioSpec(
+            name="open_road_no_neighbors",
+            title="Open Road: No Nearby Traffic",
+            expected="With no nearby vehicles, a reasonable policy should keep steady progress with little lateral drift and near-zero CBF correction.",
+            bands=[(center - 0.8, center + 0.8, "#16a34a", "nominal center band")],
+            vehicles=[ego],
+            xlim=(-24.0, 76.0),
+        ),
+        ScenarioSpec(
             name="safe_overtake_open_upper_gap",
             title="Open Passing Gap: Overtake Diagnostic",
             expected="A passing gap is available; compare which policies actually commit to it.",

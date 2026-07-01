@@ -169,14 +169,17 @@ def run_policy(
             obs = apply_scenario(env, scenario)
             env.render()
             total_reward = 0.0
-            ego_collisions = 0
+            ego_collision_events = 0
+            ego_collision_steps = 0
             correction_norms: list[float] = []
             min_h_values: list[float] = []
             for step in range(int(steps)):
                 action, _ = model.predict(obs, deterministic=True)
                 obs, reward, terminated, truncated, info = env.step(np.asarray(action, dtype=np.float32).reshape(-1)[:2])
                 total_reward += float(reward)
-                ego_collisions += int(info.get("ego_collision_events", 0))
+                ego_collision_events += int(info.get("ego_collision_events", 0))
+                if bool(info.get("ego_collision", False)):
+                    ego_collision_steps += 1
                 if "cbf_correction_norm" in info:
                     correction_norms.append(float(info.get("cbf_correction_norm", 0.0)))
                 if "cbf_min_h" in info:
@@ -191,7 +194,8 @@ def run_policy(
                     "episode": episode + 1,
                     "steps": step + 1,
                     "return": round(total_reward, 3),
-                    "ego_collisions": ego_collisions,
+                    "ego_collision_events": ego_collision_events,
+                    "ego_collision_steps": ego_collision_steps,
                     "mean_correction_norm": round(mean_correction, 4),
                     "min_h": round(min_h, 4) if np.isfinite(min_h) else None,
                 },

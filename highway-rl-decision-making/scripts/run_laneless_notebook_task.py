@@ -90,7 +90,15 @@ def apply_overrides(namespace: dict[str, Any], args: argparse.Namespace, task: d
 
 
 def _with_stem_suffix(path: Path, suffix: str) -> Path:
-    return path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+    suffixed = path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+    if os.name != "nt" or len(str(suffixed)) < 260:
+        return suffixed
+
+    digest = hashlib.sha1(suffixed.stem.encode("utf-8")).hexdigest()[:8]
+    overflow = len(str(suffixed)) - 248
+    keep = max(24, len(suffixed.stem) - overflow - len(digest) - 1)
+    short_stem = suffixed.stem[:keep].rstrip("._-")
+    return suffixed.with_name(f"{short_stem}_{digest}{suffixed.suffix}")
 
 
 def normalize_artifact_suffix(value: str | None) -> str | None:
