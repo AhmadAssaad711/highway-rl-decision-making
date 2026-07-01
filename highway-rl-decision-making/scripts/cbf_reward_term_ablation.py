@@ -106,7 +106,11 @@ def install_safety_set_reward_wrapper(namespace: dict[str, Any]) -> None:
             self.reward_config.setdefault("safety_boundary_sigma", 1.0)
             self.reward_config.setdefault("safety_potential_eps_side", namespace["CBF_EPS_SIDE"])
 
-        def _karalakou_reward(self, previous_dx: dict[int, float]) -> tuple[float, dict[str, float]]:
+        def _karalakou_reward(
+            self,
+            previous_dx: dict[int, float],
+            previous_ego_x: float | None = None,
+        ) -> tuple[float, dict[str, float]]:
             base = self.base_env
             ego = base.vehicle
             cfg = self.reward_config
@@ -124,6 +128,10 @@ def install_safety_set_reward_wrapper(namespace: dict[str, Any]) -> None:
             safety_cf = self._safety_set_potential_cost() if bool(cfg.get("use_safety_potential", 0.0)) else 0.0
             cay = self._lateral_acceleration_cost()
             overtakes = self._overtake_count(previous_dx)
+            progress_m = self._forward_progress(previous_ego_x)
+            progress_normalized = self._normalized_forward_progress(progress_m, desired_speed)
+            progress_clipped = float(np.clip(progress_normalized, 0.0, float(cfg.get("progress_clip", 1.25))))
+            progress_reward = float(cfg.get("progress_reward_weight", 0.0)) * progress_clipped
 
             denom = (
                 cfg["epsilon_r"]
@@ -133,7 +141,7 @@ def install_safety_set_reward_wrapper(namespace: dict[str, Any]) -> None:
                 + cfg.get("w_safe", 0.0) * safety_cf
                 + cfg.get("way", 0.0) * cay
             )
-            reward = cfg["epsilon_r"] / max(denom, 1e-9)
+            reward = cfg["epsilon_r"] / max(denom, 1e-9) + progress_reward
             if bool(base._last_ego_collision):
                 reward += cfg["collision_penalty"]
             elif overtakes > 0:
@@ -157,6 +165,10 @@ def install_safety_set_reward_wrapper(namespace: dict[str, Any]) -> None:
                 "target_y": float(target_y),
                 "lat_y_error_m": float(lat_y_error_m),
                 "lat_y_coherence": float(lat_y_coherence),
+                "progress_m": float(progress_m),
+                "progress_normalized": float(progress_normalized),
+                "progress_clipped": float(progress_clipped),
+                "progress_reward": float(progress_reward),
                 "target_speed": float(target_speed),
                 "zone_found": float(zone_found),
                 "overtakes": float(overtakes),
@@ -214,6 +226,7 @@ def make_reward_config(namespace: dict[str, Any], trial: dict[str, float | str |
             "use_safety_potential": float(bool(trial["use_safety_potential"])),
             "safety_potential_sigma_h": 2.0,
             "safety_boundary_sigma": 1.0,
+            "progress_reward_weight": 0.0,
         }
     )
     return config
