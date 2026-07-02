@@ -706,6 +706,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-norm", type=float, default=0.025)
     parser.add_argument("--lambda-event", type=float, default=0.02)
     parser.add_argument("--event-threshold", type=float, default=0.03)
+    parser.add_argument("--progress-reward-weight", type=float, default=0.0)
+    parser.add_argument("--progress-clip", type=float, default=1.25)
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--force-mtm-congested", action="store_true", default=True)
     parser.add_argument("--skip-videos", action="store_true")
@@ -745,14 +747,17 @@ def main() -> int:
     reward_config = make_reward_config(namespace, SAFETY_REWARD_TRIAL)
     reward_config.update(
         {
-            "progress_reward_weight": 0.0,
+            "progress_reward_weight": float(args.progress_reward_weight),
+            "progress_clip": float(args.progress_clip),
             "wf": 0.0,
             "use_current_potential": 0.0,
             "use_safety_potential": 1.0,
             "safety_potential_eps_side": float(args.eps_side),
         }
     )
-    output_name = f"sp3_{traffic_model}_e{str(args.eps_side).replace('.', 'p')}"
+    eps_tag = str(args.eps_side).replace(".", "p")
+    progress_tag = str(args.progress_reward_weight).replace(".", "p").replace("-", "m")
+    output_name = f"sp3_{traffic_model}_e{eps_tag}_p{progress_tag}"
     output_dir = args.output_dir or (Path(namespace["ARTIFACT_DIR"]) / output_name)
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -769,6 +774,8 @@ def main() -> int:
         "lambda_norm": float(args.lambda_norm),
         "lambda_event": float(args.lambda_event),
         "event_threshold": float(args.event_threshold),
+        "progress_reward_weight": float(args.progress_reward_weight),
+        "progress_clip": float(args.progress_clip),
     }
     (output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2, default=str), encoding="utf-8")
     print(

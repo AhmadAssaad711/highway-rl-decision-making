@@ -167,6 +167,14 @@ def collect_diagnostic_batch(
             intervention = bool(info.get("cbf_intervened", correction_norm > 1e-6))
             qp_success = bool(info.get("cbf_qp_success", True))
             fallback_used = bool(info.get("cbf_fallback_used", not qp_success))
+            max_constraint_violation_rl = float(info.get("cbf_max_constraint_violation_rl", np.nan))
+            max_constraint_violation_safe = float(info.get("cbf_max_constraint_violation_safe", np.nan))
+            raw_feasible = bool(
+                info.get(
+                    "cbf_raw_feasible",
+                    max_constraint_violation_rl <= float(namespace.get("CBF_QP_FEASIBILITY_TOL", 1e-6)),
+                )
+            )
 
             observations.append(obs_for_actor)
             raw_actions_scaled.append(raw_scaled)
@@ -192,12 +200,13 @@ def collect_diagnostic_batch(
                     "intervention": float(intervention),
                     "qp_success": float(qp_success),
                     "fallback_used": float(fallback_used),
+                    "raw_feasible": float(raw_feasible),
                     "strict_bc_mask_unit": float(
                         intervention and qp_success and not fallback_used and scaled_correction_norm > 0.0
                     ),
                     "min_h": float(info.get("cbf_min_h", np.nan)),
-                    "max_constraint_violation_rl": float(info.get("cbf_max_constraint_violation_rl", np.nan)),
-                    "max_constraint_violation_safe": float(info.get("cbf_max_constraint_violation_safe", np.nan)),
+                    "max_constraint_violation_rl": max_constraint_violation_rl,
+                    "max_constraint_violation_safe": max_constraint_violation_safe,
                     "ego_collision": float(bool(info.get("ego_collision", False))),
                     "ego_collision_events": float(info.get("ego_collision_events", 0)),
                     "total_collision_events": float(info.get("collisions", 0)),
@@ -650,6 +659,7 @@ def main() -> int:
                 "correction_norm_p90": percentile(samples["correction_norm"].to_numpy(dtype=float), 90),
                 "scaled_correction_norm_mean": float(samples["scaled_correction_norm"].mean()),
                 "intervention_rate": float(samples["intervention"].mean()),
+                "raw_feasible_rate": float(samples["raw_feasible"].mean()),
                 "qp_failure_rate": float(1.0 - samples["qp_success"].mean()),
                 "fallback_rate": float(samples["fallback_used"].mean()),
                 "min_h_min": float(samples["min_h"].min()),
