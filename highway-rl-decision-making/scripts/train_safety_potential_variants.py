@@ -18,7 +18,7 @@ from matplotlib.ticker import FuncFormatter
 import numpy as np
 import pandas as pd
 from stable_baselines3 import DDPG
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
 
 from cbf_lambda_event_bc_pilot_sweep import (
@@ -73,6 +73,12 @@ VARIANTS = [
         "lambda_bc": 0.03,
     },
 ]
+
+TB_VARIANT_RUN_NAMES = {
+    "ddpg": "ddpg",
+    "ddpg_cbf_reward": "cbfr",
+    "guided_ddpg_cbf": "guided",
+}
 
 SAFETY_REWARD_TRIAL = {
     "trial_name": "safety_potential_bc003",
@@ -437,6 +443,9 @@ class VariantEvalCallback(BaseCallback):
         }
         row["behavior_score"] = behavior_score(row)
         self.records.append(row)
+        recorder = self.namespace.get("record_tensorboard_row")
+        if callable(recorder):
+            recorder(self.logger, f"eval/{self.variant}", row, step=self.num_timesteps)
         print(
             "[safety-potential-eval]"
             f" {self.variant}"
@@ -520,6 +529,60 @@ def latest_checkpoint(variant_dir: Path) -> Path | None:
     return checkpoints[-1] if checkpoints else None
 
 
+def _tb_scalar(value: Any) -> float:
+    if value is None:
+        return np.nan
+    if isinstance(value, (bool, np.bool_)):
+        return float(value)
+    try:
+        scalar = float(value)
+    except (TypeError, ValueError):
+        return np.nan
+    return scalar if np.isfinite(scalar) else np.nan
+
+
+def write_summarywriter_tensorboard_row(
+    namespace: dict[str, Any],
+    *,
+    tb_root: Path,
+    run_name: str,
+    prefix: str,
+    row: dict[str, Any],
+    step: int,
+) -> Path | None:
+    writer_cls = namespace.get("SummaryWriter")
+    if writer_cls is None:
+        return None
+    run_dir = Path(tb_root) / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    writer = writer_cls(log_dir=str(run_dir))
+    kpi_index = namespace.get("TENSORBOARD_KPI_INDEX_MARKDOWN")
+    if kpi_index:
+        writer.add_text("00_kpi_index", str(kpi_index), 0)
+    specs = namespace.get("DEFAULT_TENSORBOARD_INFO_METRICS", {})
+    logged_keys: set[str] = set()
+    for tag, keys in specs.items():
+        scalar = np.nan
+        for key in keys:
+            if key not in row:
+                continue
+            scalar = _tb_scalar(row.get(key))
+            if np.isfinite(scalar):
+                logged_keys.add(key)
+                break
+        if np.isfinite(scalar):
+            writer.add_scalar(f"{prefix}/{tag}", scalar, int(step))
+    for key, value in row.items():
+        if key in logged_keys or key in {"variant", "label", "model_path"}:
+            continue
+        scalar = _tb_scalar(value)
+        if np.isfinite(scalar):
+            writer.add_scalar(f"{prefix}/99_raw/{key}", scalar, int(step))
+    writer.flush()
+    writer.close()
+    return run_dir
+
+
 def train_variant(
     namespace: dict[str, Any],
     args: argparse.Namespace,
@@ -574,12 +637,41 @@ def train_variant(
         episodes=args.train_eval_episodes,
         seed=args.seed + 10_000 * (VARIANTS.index(variant_cfg) + 1),
     )
+    learn_callback: BaseCallback = callback
+    tb_root = output_dir / "tb"
+    tb_sb3_root = tb_root / "sb3"
+    tb_custom_root = tb_root / "custom"
+    tb_run_name = TB_VARIANT_RUN_NAMES.get(variant, variant[:12])
+    if not args.skip_tensorboard and "TensorBoardMetricsBridgeCallback" in namespace:
+        tb_callback = namespace["TensorBoardMetricsBridgeCallback"](
+            variant=variant,
+            run_name=tb_run_name,
+            tb_root=tb_custom_root,
+            write_freq=int(args.tb_write_freq),
+            flush_freq=int(args.tb_flush_freq),
+            config={
+                "phase": "train",
+                "variant": variant,
+                "traffic_model": active_traffic_model(env_config),
+                "eps_side": float(args.eps_side),
+                "k0": float(args.k0),
+                "k1": float(args.k1),
+                "lambda_norm": float(args.lambda_norm if env_kind != "baseline" else 0.0),
+                "lambda_event": float(args.lambda_event if env_kind != "baseline" else 0.0),
+                "event_threshold": float(args.event_threshold),
+                "task_distance_m": float(args.task_distance_m),
+                "task_max_steps": int(args.task_max_steps),
+            },
+        )
+        learn_callback = CallbackList([callback, tb_callback])
     n_actions = train_env.action_space.shape[-1]
     model_cls = variant_cfg.get("model_class") or namespace[str(variant_cfg["model_class_name"])]
     checkpoint = latest_checkpoint(variant_dir)
     if checkpoint is not None and not args.no_resume:
         print(f"[safety-potential] loading checkpoint for {variant}: {checkpoint}", flush=True)
         model = model_cls.load(str(checkpoint), env=train_env, device=args.device)
+        if not args.skip_tensorboard:
+            model.tensorboard_log = str(tb_sb3_root)
     else:
         action_noise = namespace["make_ou_action_noise"](n_actions, n_envs=args.n_envs)
         model_kwargs: dict[str, Any] = {}
@@ -605,7 +697,7 @@ def train_variant(
             gradient_steps=1,
             action_noise=action_noise,
             policy_kwargs={"net_arch": [256, 128]},
-            tensorboard_log=None,
+            tensorboard_log=None if args.skip_tensorboard else str(tb_sb3_root),
             verbose=0,
             seed=args.seed + VARIANTS.index(variant_cfg) + 1,
             device=args.device,
@@ -627,7 +719,7 @@ def train_variant(
             chunk = min(int(args.chunk_timesteps), remaining)
             model.learn(
                 total_timesteps=chunk,
-                callback=callback,
+                callback=learn_callback,
                 reset_num_timesteps=False,
                 progress_bar=False,
             )
@@ -691,6 +783,17 @@ def train_variant(
     summary["behavior_score"] = behavior_score(summary)
     pd.DataFrame([summary]).to_csv(final_summary_path, index=False)
     (variant_dir / "run_config.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    if not args.skip_tensorboard:
+        final_tb_dir = write_summarywriter_tensorboard_row(
+            namespace,
+            tb_root=tb_root / "final",
+            run_name=tb_run_name,
+            prefix=f"eval_final/{variant}",
+            row=summary,
+            step=int(args.timesteps),
+        )
+        if final_tb_dir is not None:
+            print(f"[safety-potential-tb] final eval {variant}: {final_tb_dir}", flush=True)
     print(
         "[safety-potential-result]"
         f" {variant}"
@@ -793,6 +896,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-reward-weight", type=float, default=0.0)
     parser.add_argument("--progress-clip", type=float, default=1.25)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--skip-tensorboard", action="store_true")
+    parser.add_argument("--tb-write-freq", type=int, default=100)
+    parser.add_argument("--tb-flush-freq", type=int, default=500)
     parser.add_argument("--force-mtm-congested", action="store_true", default=True)
     parser.add_argument("--skip-videos", action="store_true")
     parser.add_argument("--skip-normal-video", action="store_true")
@@ -863,6 +969,9 @@ def main() -> int:
         "task_max_steps": int(args.task_max_steps),
         "progress_reward_weight": float(args.progress_reward_weight),
         "progress_clip": float(args.progress_clip),
+        "tensorboard_enabled": bool(not args.skip_tensorboard),
+        "tb_write_freq": int(args.tb_write_freq),
+        "tb_flush_freq": int(args.tb_flush_freq),
     }
     (output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2, default=str), encoding="utf-8")
     print(
@@ -873,6 +982,7 @@ def main() -> int:
         f" eps={args.eps_side:g}"
         f" task={args.task_distance_m:g}m/{args.task_max_steps}steps"
         f" progress={reward_config.get('progress_reward_weight', 0.0):g}",
+        f" tensorboard={not args.skip_tensorboard}",
         flush=True,
     )
 

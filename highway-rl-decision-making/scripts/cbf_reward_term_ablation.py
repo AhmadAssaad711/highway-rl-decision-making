@@ -31,7 +31,7 @@ from laneless_script_config import active_traffic_model, add_env_config_args, en
 
 warnings.filterwarnings("ignore", message="OSQP exited.*")
 
-NOTEBOOK_DEPS = [2, 4, 6, 7, 9, 32, 34, 36, 38, 40, 42, 52]
+NOTEBOOK_DEPS = [2, 4, 6, 7, 9, 10, 32, 34, 36, 38, 40, 42, 52]
 
 DEFAULT_TRIALS: list[dict[str, float | str | bool]] = [
     {
