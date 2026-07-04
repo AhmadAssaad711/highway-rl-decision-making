@@ -106,8 +106,8 @@ def main() -> int:
     notebook_path = project_root / "notebooks" / "lanelessKaralakou.ipynb"
     namespace: dict[str, Any] = {"__name__": "__main__"}
     base_cells = [2, 4, 6, 7, 9]
-    cbf_cells = [31, 33, 35, 37, 39, 41]
-    guided_cells = [51]
+    cbf_cells = [32, 34, 36, 38, 40, 42]
+    guided_cells = [52]
     needs_cbf = args.variant in {"ddpg-cbf", "guided-ddpg-cbf"}
     exec_notebook_cells(
         notebook_path,

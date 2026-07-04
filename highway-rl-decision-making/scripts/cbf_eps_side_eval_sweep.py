@@ -278,7 +278,7 @@ def main() -> int:
     project_root = find_project_root(args.project_root or Path.cwd())
     notebook_path = project_root / "notebooks" / "lanelessKaralakou.ipynb"
     namespace: dict[str, Any] = {"__name__": "__main__"}
-    exec_notebook_cells(notebook_path, [2, 4, 6, 7, 9, 31, 33, 35, 37, 39, 41], namespace)
+    exec_notebook_cells(notebook_path, [2, 4, 6, 7, 9, 32, 34, 36, 38, 40, 42], namespace)
     namespace["DEVICE"] = args.device
 
     artifact_dir: Path = namespace["ARTIFACT_DIR"]

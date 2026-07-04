@@ -26,7 +26,7 @@ from laneless_script_config import active_traffic_model, add_env_config_args, en
 
 warnings.filterwarnings("ignore", message="OSQP exited.*")
 
-NOTEBOOK_DEPS = [2, 4, 6, 7, 9, 31, 33, 35, 37, 39, 41]
+NOTEBOOK_DEPS = [2, 4, 6, 7, 9, 32, 34, 36, 38, 40, 42]
 
 DEFAULT_TRIALS: list[tuple[str, float, float, float]] = [
     ("norm0025_event000_bc000", 0.025, 0.00, 0.00),
@@ -160,6 +160,8 @@ def install_event_penalty_env(namespace: dict[str, Any]) -> None:
         normalize = namespace["NORMALIZE_RL_OBSERVATIONS"] if normalize_observation is None else normalize_observation
         if normalize:
             env = namespace["LaneFreeObservationNormalizationWrapper"](env, clip=namespace["OBSERVATION_CLIP"])
+        if "KPIInfoWrapper" in namespace:
+            env = namespace["KPIInfoWrapper"](env, intervention_threshold=float(event_threshold))
         env = Monitor(env)
         env.reset(seed=seed)
         return env

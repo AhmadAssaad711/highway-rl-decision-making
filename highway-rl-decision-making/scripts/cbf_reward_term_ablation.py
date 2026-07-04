@@ -31,7 +31,7 @@ from laneless_script_config import active_traffic_model, add_env_config_args, en
 
 warnings.filterwarnings("ignore", message="OSQP exited.*")
 
-NOTEBOOK_DEPS = [2, 4, 6, 7, 9, 31, 33, 35, 37, 39, 41, 51]
+NOTEBOOK_DEPS = [2, 4, 6, 7, 9, 32, 34, 36, 38, 40, 42, 52]
 
 DEFAULT_TRIALS: list[dict[str, float | str | bool]] = [
     {
@@ -261,6 +261,8 @@ def make_single_env(
     normalize = namespace["NORMALIZE_RL_OBSERVATIONS"] if normalize_observation is None else normalize_observation
     if normalize:
         env = namespace["LaneFreeObservationNormalizationWrapper"](env, clip=namespace["OBSERVATION_CLIP"])
+    if "KPIInfoWrapper" in namespace:
+        env = namespace["KPIInfoWrapper"](env)
     env = Monitor(env)
     env.reset(seed=seed)
     return env
@@ -347,6 +349,7 @@ def evaluate_model(
         old_potential_costs: list[float] = []
         safety_potential_costs: list[float] = []
         lateral_costs: list[float] = []
+        kpi_info_rows: list[dict[str, Any]] = []
         ego_collisions = 0
         ego_collision_steps = 0
         all_collision_events = 0
@@ -366,6 +369,7 @@ def evaluate_model(
             lat_error = float(info.get("karalakou_lat_y_error_m", np.nan))
             if np.isfinite(lat_error):
                 lat_y_errors.append(lat_error)
+            kpi_info_rows.append(dict(info))
             correction_norms.append(correction)
             meaningful_correction_norms.append(meaningful_correction)
             event_interventions.append(float(info.get("cbf_event_intervened", correction > event_threshold)))
@@ -382,45 +386,90 @@ def evaluate_model(
             step_count += 1
             done = bool(terminated or truncated)
 
-        rows.append(
-            {
-                "episode": float(episode),
-                "steps": float(step_count),
-                "return": float(np.sum(rewards)),
-                "mean_speed": float(np.mean(speeds)) if speeds else 0.0,
-                "mean_abs_speed_error": float(np.mean(abs_speed_errors)) if abs_speed_errors else 0.0,
-                "mean_lat_y_error_m": float(np.mean(lat_y_errors)) if lat_y_errors else np.nan,
-                "mean_correction_norm": float(np.mean(correction_norms)) if correction_norms else 0.0,
-                "max_correction_norm": float(np.max(correction_norms)) if correction_norms else 0.0,
-                "mean_meaningful_correction_norm": float(np.mean(meaningful_correction_norms))
-                if meaningful_correction_norms
-                else 0.0,
-                "max_meaningful_correction_norm": float(np.max(meaningful_correction_norms))
-                if meaningful_correction_norms
-                else 0.0,
-                "event_intervention_rate": float(np.mean(event_interventions)) if event_interventions else 0.0,
-                "numerical_intervention_rate": float(np.mean(numerical_interventions)) if numerical_interventions else 0.0,
-                "qp_failure_rate": float(1.0 - np.mean(qp_successes)) if qp_successes else 0.0,
-                "min_h": float(np.nanmin(min_h_values)) if min_h_values and not np.all(np.isnan(min_h_values)) else np.nan,
-                "mean_old_potential_cost": float(np.mean(old_potential_costs)) if old_potential_costs else 0.0,
-                "mean_safety_potential_cost": float(np.mean(safety_potential_costs)) if safety_potential_costs else 0.0,
-                "mean_lateral_y_cost": float(np.mean(lateral_costs)) if lateral_costs else 0.0,
-                "ego_collisions": float(ego_collisions),
-                "ego_collision_steps": float(ego_collision_steps),
-                "total_collision_events": float(all_collision_events),
-            }
-        )
+        episode_row = {
+            "episode": float(episode),
+            "steps": float(step_count),
+            "episode_length_steps": float(step_count),
+            "return": float(np.sum(rewards)),
+            "episode_return": float(np.sum(rewards)),
+            "mean_speed": float(np.mean(speeds)) if speeds else 0.0,
+            "mean_abs_speed_error": float(np.mean(abs_speed_errors)) if abs_speed_errors else 0.0,
+            "mean_lat_y_error_m": float(np.mean(lat_y_errors)) if lat_y_errors else np.nan,
+            "mean_correction_norm": float(np.mean(correction_norms)) if correction_norms else 0.0,
+            "max_correction_norm": float(np.max(correction_norms)) if correction_norms else 0.0,
+            "mean_meaningful_correction_norm": float(np.mean(meaningful_correction_norms))
+            if meaningful_correction_norms
+            else 0.0,
+            "max_meaningful_correction_norm": float(np.max(meaningful_correction_norms))
+            if meaningful_correction_norms
+            else 0.0,
+            "event_intervention_rate": float(np.mean(event_interventions)) if event_interventions else 0.0,
+            "numerical_intervention_rate": float(np.mean(numerical_interventions)) if numerical_interventions else 0.0,
+            "qp_failure_rate": float(1.0 - np.mean(qp_successes)) if qp_successes else 0.0,
+            "min_h": float(np.nanmin(min_h_values)) if min_h_values and not np.all(np.isnan(min_h_values)) else np.nan,
+            "mean_old_potential_cost": float(np.mean(old_potential_costs)) if old_potential_costs else 0.0,
+            "mean_safety_potential_cost": float(np.mean(safety_potential_costs)) if safety_potential_costs else 0.0,
+            "mean_lateral_y_cost": float(np.mean(lateral_costs)) if lateral_costs else 0.0,
+            "ego_collisions": float(ego_collisions),
+            "ego_collision_steps": float(ego_collision_steps),
+            "total_collision_events": float(all_collision_events),
+        }
+        summarize_episode_kpis = namespace.get("summarize_episode_kpis")
+        if callable(summarize_episode_kpis):
+            episode_row.update(
+                summarize_episode_kpis(
+                    kpi_info_rows,
+                    rewards=rewards,
+                    task_completed=False,
+                    fallback_steps=step_count,
+                    fallback_distance_m=0.0,
+                    fallback_dt_s=namespace["kpi_policy_dt"](env) if "kpi_policy_dt" in namespace else np.nan,
+                )
+            )
+        rows.append(episode_row)
         env.close()
     return pd.DataFrame(rows)
+
+
+def _metric_series(metrics: pd.DataFrame, column: str) -> pd.Series:
+    if column not in metrics.columns:
+        return pd.Series(dtype=float)
+    return pd.to_numeric(metrics[column], errors="coerce").dropna()
+
+
+def _metric_mean(metrics: pd.DataFrame, column: str, default: float = 0.0) -> float:
+    values = _metric_series(metrics, column)
+    return float(values.mean()) if not values.empty else float(default)
+
+
+def _metric_min(metrics: pd.DataFrame, column: str, default: float = np.nan) -> float:
+    values = _metric_series(metrics, column)
+    return float(values.min()) if not values.empty else float(default)
+
+
+def _metric_max(metrics: pd.DataFrame, column: str, default: float = 0.0) -> float:
+    values = _metric_series(metrics, column)
+    return float(values.max()) if not values.empty else float(default)
 
 
 def summarize(metrics: pd.DataFrame) -> dict[str, float]:
     return {
         "episodes": float(len(metrics)),
         "steps_mean": float(metrics["steps"].mean()),
+        "episode_length_steps_mean": float(metrics.get("episode_length_steps", metrics["steps"]).mean()),
         "return_mean": float(metrics["return"].mean()),
+        "episode_return_mean": float(metrics.get("episode_return", metrics["return"]).mean()),
+        "completion_rate": float(metrics.get("task_completed", pd.Series([0.0])).mean()),
+        "task_timeout_rate": float(metrics.get("task_timeout", pd.Series([0.0])).mean()),
+        "task_distance_traveled_m_mean": float(metrics.get("task_distance_traveled_m", pd.Series([0.0])).mean()),
+        "task_progress_ratio_mean": float(metrics.get("task_progress_ratio", pd.Series([0.0])).mean()),
+        "episode_time_s_mean": _metric_mean(metrics, "episode_time_s", default=np.nan),
+        "completion_time_s_mean": _metric_mean(metrics, "completion_time_s", default=np.nan),
+        "distance_traveled_m_mean": _metric_mean(metrics, "distance_traveled_m"),
+        "progress_rate_mps_mean": _metric_mean(metrics, "progress_rate_mps", default=np.nan),
         "return_std": float(metrics["return"].std()),
         "mean_speed": float(metrics["mean_speed"].mean()),
+        "speed_std_mean": _metric_mean(metrics, "speed_std"),
         "mean_abs_speed_error": float(metrics["mean_abs_speed_error"].mean()),
         "mean_lat_y_error_m": float(metrics["mean_lat_y_error_m"].mean()),
         "mean_correction_norm": float(metrics["mean_correction_norm"].mean()),
@@ -431,16 +480,41 @@ def summarize(metrics: pd.DataFrame) -> dict[str, float]:
         "max_meaningful_correction_norm": float(
             metrics.get("max_meaningful_correction_norm", metrics["max_correction_norm"]).max()
         ),
+        "mean_raw_safe_gap_norm": _metric_mean(metrics, "mean_raw_safe_gap_norm"),
+        "max_raw_safe_gap_norm": _metric_max(metrics, "max_raw_safe_gap_norm"),
         "event_intervention_rate": float(metrics["event_intervention_rate"].mean()),
         "numerical_intervention_rate": float(metrics["numerical_intervention_rate"].mean()),
+        "qp_attempt_count_mean": _metric_mean(metrics, "qp_attempt_count"),
+        "qp_failure_count_mean": _metric_mean(metrics, "qp_failure_count"),
         "qp_failure_rate": float(metrics["qp_failure_rate"].mean()),
-        "min_h": float(metrics["min_h"].min()),
+        "min_h": _metric_min(metrics, "min_h"),
+        "h_min": _metric_min(metrics, "h_min", default=_metric_min(metrics, "min_h")),
+        "boundary_h_min": _metric_min(metrics, "boundary_h_min"),
         "mean_old_potential_cost": float(metrics["mean_old_potential_cost"].mean()),
         "mean_safety_potential_cost": float(metrics["mean_safety_potential_cost"].mean()),
         "mean_lateral_y_cost": float(metrics["mean_lateral_y_cost"].mean()),
         "ego_collisions_mean": float(metrics["ego_collisions"].mean()),
         "ego_collision_steps_mean": float(metrics["ego_collision_steps"].mean()),
         "total_collision_events_mean": float(metrics["total_collision_events"].mean()),
+        "ego_collisions_per_km_mean": _metric_mean(metrics, "ego_collisions_per_km"),
+        "total_collision_events_per_km_mean": _metric_mean(metrics, "total_collision_events_per_km"),
+        "mean_abs_accel_x": _metric_mean(metrics, "mean_abs_accel_x"),
+        "mean_abs_accel_y": _metric_mean(metrics, "mean_abs_accel_y"),
+        "mean_accel_norm": _metric_mean(metrics, "mean_accel_norm"),
+        "mean_abs_delta_accel_x": _metric_mean(metrics, "mean_abs_delta_accel_x"),
+        "mean_abs_delta_accel_y": _metric_mean(metrics, "mean_abs_delta_accel_y"),
+        "mean_delta_accel_norm": _metric_mean(metrics, "mean_delta_accel_norm"),
+        "mean_abs_jerk_x": _metric_mean(metrics, "mean_abs_jerk_x"),
+        "mean_abs_jerk_y": _metric_mean(metrics, "mean_abs_jerk_y"),
+        "mean_jerk_norm": _metric_mean(metrics, "mean_jerk_norm"),
+        "action_saturation_rate": _metric_mean(metrics, "action_saturation_rate"),
+        "lateral_shift_total_m_mean": _metric_mean(metrics, "lateral_shift_total_m"),
+        "lateral_shift_rate_mps_mean": _metric_mean(metrics, "lateral_shift_rate_mps", default=np.nan),
+        "overtakes_count_mean": _metric_mean(metrics, "overtakes_count"),
+        "overtaken_count_mean": _metric_mean(metrics, "overtaken_count"),
+        "mean_neighbor_count": _metric_mean(metrics, "mean_neighbor_count"),
+        "mean_neighbor_density_per_km": _metric_mean(metrics, "mean_neighbor_density_per_km"),
+        "max_neighbor_density_per_km": _metric_max(metrics, "max_neighbor_density_per_km"),
     }
 
 

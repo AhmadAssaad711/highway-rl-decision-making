@@ -138,26 +138,26 @@ def apply_traffic_artifact_suffix(namespace: dict[str, Any], artifact_suffix: st
 
 TASKS = {
     "ppo-train": {
-        "deps": [2, 4, 6, 7, 9],
-        "cell": 11,
+        "deps": [2, 4, 6, 7, 9, 10],
+        "cell": 12,
         "flag": "RUN_PPO_TRAIN",
         "timesteps_key": "TOTAL_TIMESTEPS",
     },
     "ddpg-train": {
-        "deps": [2, 4, 6, 7, 9],
-        "cell": 22,
+        "deps": [2, 4, 6, 7, 9, 10],
+        "cell": 23,
         "flag": "RUN_DDPG_TRAIN",
         "timesteps_key": "DDPG_TOTAL_TIMESTEPS",
     },
     "ddpg-cbf-train": {
-        "deps": [2, 4, 6, 7, 9, 31, 33, 35, 37, 39, 41],
-        "cell": 43,
+        "deps": [2, 4, 6, 7, 9, 10, 32, 34, 36, 38, 40, 42],
+        "cell": 44,
         "flag": "RUN_DDPG_CBF_TRAIN",
         "timesteps_key": "DDPG_CBF_TOTAL_TIMESTEPS",
     },
     "guided-ddpg-cbf-train": {
-        "deps": [2, 4, 6, 7, 9, 31, 33, 35, 37, 39, 41],
-        "cell": 51,
+        "deps": [2, 4, 6, 7, 9, 10, 32, 34, 36, 38, 40, 42],
+        "cell": 52,
         "flag": "RUN_GUIDED_DDPG_CBF_TRAIN",
         "timesteps_key": "GUIDED_DDPG_CBF_TOTAL_TIMESTEPS",
     },

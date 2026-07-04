@@ -126,6 +126,8 @@ def make_baseline_single_env(
     normalize = namespace["NORMALIZE_RL_OBSERVATIONS"] if normalize_observation is None else normalize_observation
     if normalize:
         env = namespace["LaneFreeObservationNormalizationWrapper"](env, clip=namespace["OBSERVATION_CLIP"])
+    if "KPIInfoWrapper" in namespace:
+        env = namespace["KPIInfoWrapper"](env)
     env = Monitor(env)
     env.reset(seed=seed)
     return env
@@ -186,6 +188,9 @@ def make_eval_env(
     k0: float,
     k1: float,
     eps_side: float,
+    use_distance_task: bool,
+    task_distance_m: float,
+    task_max_steps: int,
 ) -> gym.Env:
     if env_kind == "baseline":
         env = make_baseline_single_env(
@@ -206,7 +211,14 @@ def make_eval_env(
             env_config=env_config,
             reward_config=reward_config,
         )
-    namespace["configure_paper_evaluation_env"](env, steps=namespace["PAPER_EVAL_STEPS"])
+    if use_distance_task and "make_task_evaluation_wrapper" in namespace:
+        env = namespace["make_task_evaluation_wrapper"](
+            env,
+            task_distance_m=float(task_distance_m),
+            max_steps=int(task_max_steps),
+        )
+    else:
+        namespace["configure_paper_evaluation_env"](env, steps=namespace["PAPER_EVAL_STEPS"])
     return env
 
 
@@ -223,6 +235,9 @@ def evaluate_model(
     k0: float,
     k1: float,
     eps_side: float,
+    use_distance_task: bool,
+    task_distance_m: float,
+    task_max_steps: int,
 ) -> pd.DataFrame:
     rows: list[dict[str, float]] = []
     for episode in range(episodes):
@@ -236,6 +251,9 @@ def evaluate_model(
             k0=k0,
             k1=k1,
             eps_side=eps_side,
+            use_distance_task=use_distance_task,
+            task_distance_m=task_distance_m,
+            task_max_steps=task_max_steps,
         )
         obs, _ = env.reset(seed=seed + episode)
         done = False
@@ -254,6 +272,8 @@ def evaluate_model(
         safety_potential_costs: list[float] = []
         lateral_costs: list[float] = []
         progress_rewards: list[float] = []
+        kpi_info_rows: list[dict[str, Any]] = []
+        last_task_info: dict[str, Any] = {}
         ego_collisions = 0
         ego_collision_steps = 0
         all_collision_events = 0
@@ -273,6 +293,7 @@ def evaluate_model(
             lat_error = float(info.get("karalakou_lat_y_error_m", np.nan))
             if np.isfinite(lat_error):
                 lat_y_errors.append(lat_error)
+            kpi_info_rows.append(dict(info))
             correction_norms.append(correction)
             meaningful_correction_norms.append(meaningful_correction)
             event_interventions.append(float(info.get("cbf_event_intervened", correction > event_threshold)))
@@ -283,6 +304,13 @@ def evaluate_model(
             safety_potential_costs.append(float(info.get("karalakou_safety_cf", 0.0)))
             lateral_costs.append(float(info.get("karalakou_cy", 0.0)))
             progress_rewards.append(float(info.get("karalakou_progress_reward", 0.0)))
+            last_task_info = {
+                "task_distance_m": float(info.get("task_distance_m", task_distance_m)),
+                "task_distance_traveled_m": float(info.get("task_distance_traveled_m", 0.0)),
+                "task_progress_ratio": float(info.get("task_progress_ratio", 0.0)),
+                "task_completed": bool(info.get("task_completed", False)),
+                "task_timeout": bool(info.get("task_timeout", False)),
+            }
             all_collision_events += int(info.get("collisions", 0))
             ego_collisions += int(info.get("ego_collision_events", 0))
             if bool(info.get("ego_collision", False)):
@@ -290,37 +318,55 @@ def evaluate_model(
             step_count += 1
             done = bool(terminated or truncated)
 
-        rows.append(
-            {
-                "episode": float(episode),
-                "steps": float(step_count),
-                "return": float(np.sum(rewards)),
-                "mean_speed": float(np.mean(speeds)) if speeds else 0.0,
-                "mean_abs_speed_error": float(np.mean(abs_speed_errors)) if abs_speed_errors else 0.0,
-                "mean_lat_y_error_m": float(np.mean(lat_y_errors)) if lat_y_errors else np.nan,
-                "mean_correction_norm": float(np.mean(correction_norms)) if correction_norms else 0.0,
-                "max_correction_norm": float(np.max(correction_norms)) if correction_norms else 0.0,
-                "mean_meaningful_correction_norm": float(np.mean(meaningful_correction_norms))
-                if meaningful_correction_norms
-                else 0.0,
-                "max_meaningful_correction_norm": float(np.max(meaningful_correction_norms))
-                if meaningful_correction_norms
-                else 0.0,
-                "event_intervention_rate": float(np.mean(event_interventions)) if event_interventions else 0.0,
-                "numerical_intervention_rate": float(np.mean(numerical_interventions)) if numerical_interventions else 0.0,
-                "qp_failure_rate": float(1.0 - np.mean(qp_successes)) if qp_successes else 0.0,
-                "min_h": float(np.nanmin(min_h_values))
-                if min_h_values and not np.all(np.isnan(min_h_values))
-                else np.nan,
-                "mean_old_potential_cost": float(np.mean(old_potential_costs)) if old_potential_costs else 0.0,
-                "mean_safety_potential_cost": float(np.mean(safety_potential_costs)) if safety_potential_costs else 0.0,
-                "mean_lateral_y_cost": float(np.mean(lateral_costs)) if lateral_costs else 0.0,
-                "mean_progress_reward": float(np.mean(progress_rewards)) if progress_rewards else 0.0,
-                "ego_collisions": float(ego_collisions),
-                "ego_collision_steps": float(ego_collision_steps),
-                "total_collision_events": float(all_collision_events),
-            }
-        )
+        episode_row = {
+            "episode": float(episode),
+            "steps": float(step_count),
+            "episode_length_steps": float(step_count),
+            "return": float(np.sum(rewards)),
+            "episode_return": float(np.sum(rewards)),
+            "task_completed": float(last_task_info.get("task_completed", False)),
+            "task_timeout": float(last_task_info.get("task_timeout", False)),
+            "task_distance_m": float(last_task_info.get("task_distance_m", task_distance_m)),
+            "task_distance_traveled_m": float(last_task_info.get("task_distance_traveled_m", 0.0)),
+            "task_progress_ratio": float(last_task_info.get("task_progress_ratio", 0.0)),
+            "mean_speed": float(np.mean(speeds)) if speeds else 0.0,
+            "mean_abs_speed_error": float(np.mean(abs_speed_errors)) if abs_speed_errors else 0.0,
+            "mean_lat_y_error_m": float(np.mean(lat_y_errors)) if lat_y_errors else np.nan,
+            "mean_correction_norm": float(np.mean(correction_norms)) if correction_norms else 0.0,
+            "max_correction_norm": float(np.max(correction_norms)) if correction_norms else 0.0,
+            "mean_meaningful_correction_norm": float(np.mean(meaningful_correction_norms))
+            if meaningful_correction_norms
+            else 0.0,
+            "max_meaningful_correction_norm": float(np.max(meaningful_correction_norms))
+            if meaningful_correction_norms
+            else 0.0,
+            "event_intervention_rate": float(np.mean(event_interventions)) if event_interventions else 0.0,
+            "numerical_intervention_rate": float(np.mean(numerical_interventions)) if numerical_interventions else 0.0,
+            "qp_failure_rate": float(1.0 - np.mean(qp_successes)) if qp_successes else 0.0,
+            "min_h": float(np.nanmin(min_h_values))
+            if min_h_values and not np.all(np.isnan(min_h_values))
+            else np.nan,
+            "mean_old_potential_cost": float(np.mean(old_potential_costs)) if old_potential_costs else 0.0,
+            "mean_safety_potential_cost": float(np.mean(safety_potential_costs)) if safety_potential_costs else 0.0,
+            "mean_lateral_y_cost": float(np.mean(lateral_costs)) if lateral_costs else 0.0,
+            "mean_progress_reward": float(np.mean(progress_rewards)) if progress_rewards else 0.0,
+            "ego_collisions": float(ego_collisions),
+            "ego_collision_steps": float(ego_collision_steps),
+            "total_collision_events": float(all_collision_events),
+        }
+        summarize_episode_kpis = namespace.get("summarize_episode_kpis")
+        if callable(summarize_episode_kpis):
+            episode_row.update(
+                summarize_episode_kpis(
+                    kpi_info_rows,
+                    rewards=rewards,
+                    task_completed=bool(last_task_info.get("task_completed", False)),
+                    fallback_steps=step_count,
+                    fallback_distance_m=float(last_task_info.get("task_distance_traveled_m", 0.0)),
+                    fallback_dt_s=namespace["kpi_policy_dt"](env) if "kpi_policy_dt" in namespace else np.nan,
+                )
+            )
+        rows.append(episode_row)
         env.close()
     return pd.DataFrame(rows)
 
@@ -338,6 +384,9 @@ class VariantEvalCallback(BaseCallback):
         k0: float,
         k1: float,
         eps_side: float,
+        use_distance_task: bool,
+        task_distance_m: float,
+        task_max_steps: int,
         eval_freq: int,
         episodes: int,
         seed: int,
@@ -352,6 +401,9 @@ class VariantEvalCallback(BaseCallback):
         self.k0 = float(k0)
         self.k1 = float(k1)
         self.eps_side = float(eps_side)
+        self.use_distance_task = bool(use_distance_task)
+        self.task_distance_m = float(task_distance_m)
+        self.task_max_steps = int(task_max_steps)
         self.eval_freq = int(eval_freq)
         self.episodes = int(episodes)
         self.seed = int(seed)
@@ -374,6 +426,9 @@ class VariantEvalCallback(BaseCallback):
             k0=self.k0,
             k1=self.k1,
             eps_side=self.eps_side,
+            use_distance_task=self.use_distance_task,
+            task_distance_m=self.task_distance_m,
+            task_max_steps=self.task_max_steps,
         )
         row: dict[str, float | str] = {
             "variant": self.variant,
@@ -387,6 +442,7 @@ class VariantEvalCallback(BaseCallback):
             f" {self.variant}"
             f" steps={self.num_timesteps:,}"
             f" return={row['return_mean']:.2f}"
+            f" complete={row.get('completion_rate', 0.0):.2%}"
             f" abs_speed={row['mean_abs_speed_error']:.3f}"
             f" lat_y={row['mean_lat_y_error_m']:.3f}"
             f" event_int={row['event_intervention_rate']:.2%}"
@@ -511,6 +567,9 @@ def train_variant(
         k0=args.k0,
         k1=args.k1,
         eps_side=args.eps_side,
+        use_distance_task=not args.legacy_fixed_step_eval,
+        task_distance_m=args.task_distance_m,
+        task_max_steps=args.task_max_steps,
         eval_freq=args.train_eval_freq,
         episodes=args.train_eval_episodes,
         seed=args.seed + 10_000 * (VARIANTS.index(variant_cfg) + 1),
@@ -599,6 +658,9 @@ def train_variant(
         k0=args.k0,
         k1=args.k1,
         eps_side=args.eps_side,
+        use_distance_task=not args.legacy_fixed_step_eval,
+        task_distance_m=args.task_distance_m,
+        task_max_steps=args.task_max_steps,
     )
     final_metrics.to_csv(final_episodes_path, index=False)
     summary: dict[str, float | str | bool] = {
@@ -621,6 +683,9 @@ def train_variant(
         "use_current_potential": bool(reward_config["use_current_potential"]),
         "use_safety_potential": bool(reward_config["use_safety_potential"]),
         "progress_reward_weight": float(reward_config.get("progress_reward_weight", 0.0)),
+        "use_distance_task_eval": bool(not args.legacy_fixed_step_eval),
+        "task_distance_m": float(args.task_distance_m),
+        "task_max_steps": float(args.task_max_steps),
         **summarize(final_metrics),
     }
     summary["behavior_score"] = behavior_score(summary)
@@ -630,6 +695,7 @@ def train_variant(
         "[safety-potential-result]"
         f" {variant}"
         f" return={summary['return_mean']:.2f}"
+        f" complete={summary.get('completion_rate', 0.0):.2%}"
         f" abs_speed={summary['mean_abs_speed_error']:.3f}"
         f" lat_y={summary['mean_lat_y_error_m']:.3f}"
         f" event_int={summary['event_intervention_rate']:.2%}"
@@ -721,6 +787,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-norm", type=float, default=0.025)
     parser.add_argument("--lambda-event", type=float, default=0.02)
     parser.add_argument("--event-threshold", type=float, default=0.03)
+    parser.add_argument("--task-distance-m", type=float, default=1000.0)
+    parser.add_argument("--task-max-steps", type=int, default=1200)
+    parser.add_argument("--legacy-fixed-step-eval", action="store_true")
     parser.add_argument("--progress-reward-weight", type=float, default=0.0)
     parser.add_argument("--progress-clip", type=float, default=1.25)
     parser.add_argument("--no-resume", action="store_true")
@@ -789,6 +858,9 @@ def main() -> int:
         "lambda_norm": float(args.lambda_norm),
         "lambda_event": float(args.lambda_event),
         "event_threshold": float(args.event_threshold),
+        "use_distance_task_eval": bool(not args.legacy_fixed_step_eval),
+        "task_distance_m": float(args.task_distance_m),
+        "task_max_steps": int(args.task_max_steps),
         "progress_reward_weight": float(args.progress_reward_weight),
         "progress_clip": float(args.progress_clip),
     }
@@ -799,6 +871,7 @@ def main() -> int:
         f" traffic={traffic_model}"
         f" timesteps={args.timesteps:,}"
         f" eps={args.eps_side:g}"
+        f" task={args.task_distance_m:g}m/{args.task_max_steps}steps"
         f" progress={reward_config.get('progress_reward_weight', 0.0):g}",
         flush=True,
     )
@@ -828,14 +901,27 @@ def main() -> int:
         display_cols = [
             "variant",
             "return_mean",
+            "completion_rate",
+            "episode_length_steps_mean",
+            "distance_traveled_m_mean",
+            "episode_time_s_mean",
             "mean_abs_speed_error",
+            "speed_std_mean",
             "mean_lat_y_error_m",
+            "ego_collisions_per_km_mean",
+            "h_min",
+            "boundary_h_min",
             "event_intervention_rate",
             "mean_correction_norm",
+            "mean_raw_safe_gap_norm",
             "qp_failure_rate",
+            "mean_jerk_norm",
+            "action_saturation_rate",
+            "mean_neighbor_density_per_km",
             "ego_collisions_mean",
             "mean_safety_potential_cost",
         ]
+        display_cols = [column for column in display_cols if column in summary_frame.columns]
         print(summary_frame[display_cols].to_string(index=False), flush=True)
 
     if not args.skip_videos:

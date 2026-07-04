@@ -16,7 +16,7 @@ import pandas as pd
 import torch as th
 
 
-NOTEBOOK_DEPS = [2, 4, 6, 7, 9, 31, 33, 35, 37, 39, 41]
+NOTEBOOK_DEPS = [2, 4, 6, 7, 9, 32, 34, 36, 38, 40, 42]
 
 
 def set_stable_native_defaults() -> None:
