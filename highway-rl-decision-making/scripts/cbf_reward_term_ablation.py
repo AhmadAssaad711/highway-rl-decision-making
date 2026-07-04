@@ -339,6 +339,7 @@ def evaluate_model(
         abs_speed_errors: list[float] = []
         lat_y_errors: list[float] = []
         correction_norms: list[float] = []
+        meaningful_correction_norms: list[float] = []
         event_interventions: list[float] = []
         numerical_interventions: list[float] = []
         qp_successes: list[float] = []
@@ -357,6 +358,7 @@ def evaluate_model(
             speed = float(base.vehicle.vx)
             desired_speed = float(base.vehicle.desired_speed)
             correction = float(info.get("cbf_correction_norm", 0.0))
+            meaningful_correction = float(info.get("cbf_meaningful_correction_norm", max(correction - event_threshold, 0.0)))
 
             rewards.append(float(reward))
             speeds.append(speed)
@@ -365,6 +367,7 @@ def evaluate_model(
             if np.isfinite(lat_error):
                 lat_y_errors.append(lat_error)
             correction_norms.append(correction)
+            meaningful_correction_norms.append(meaningful_correction)
             event_interventions.append(float(info.get("cbf_event_intervened", correction > event_threshold)))
             numerical_interventions.append(float(info.get("cbf_intervened", correction > 1e-6)))
             qp_successes.append(float(info.get("cbf_qp_success", True)))
@@ -389,6 +392,12 @@ def evaluate_model(
                 "mean_lat_y_error_m": float(np.mean(lat_y_errors)) if lat_y_errors else np.nan,
                 "mean_correction_norm": float(np.mean(correction_norms)) if correction_norms else 0.0,
                 "max_correction_norm": float(np.max(correction_norms)) if correction_norms else 0.0,
+                "mean_meaningful_correction_norm": float(np.mean(meaningful_correction_norms))
+                if meaningful_correction_norms
+                else 0.0,
+                "max_meaningful_correction_norm": float(np.max(meaningful_correction_norms))
+                if meaningful_correction_norms
+                else 0.0,
                 "event_intervention_rate": float(np.mean(event_interventions)) if event_interventions else 0.0,
                 "numerical_intervention_rate": float(np.mean(numerical_interventions)) if numerical_interventions else 0.0,
                 "qp_failure_rate": float(1.0 - np.mean(qp_successes)) if qp_successes else 0.0,
@@ -416,6 +425,12 @@ def summarize(metrics: pd.DataFrame) -> dict[str, float]:
         "mean_lat_y_error_m": float(metrics["mean_lat_y_error_m"].mean()),
         "mean_correction_norm": float(metrics["mean_correction_norm"].mean()),
         "max_correction_norm": float(metrics["max_correction_norm"].max()),
+        "mean_meaningful_correction_norm": float(
+            metrics.get("mean_meaningful_correction_norm", metrics["mean_correction_norm"]).mean()
+        ),
+        "max_meaningful_correction_norm": float(
+            metrics.get("max_meaningful_correction_norm", metrics["max_correction_norm"]).max()
+        ),
         "event_intervention_rate": float(metrics["event_intervention_rate"].mean()),
         "numerical_intervention_rate": float(metrics["numerical_intervention_rate"].mean()),
         "qp_failure_rate": float(metrics["qp_failure_rate"].mean()),
@@ -435,7 +450,7 @@ def behavior_score(row: dict[str, float | str | bool]) -> float:
         - 28.0 * float(row["mean_abs_speed_error"])
         - 18.0 * float(row["mean_lat_y_error_m"])
         - 120.0 * float(row["event_intervention_rate"])
-        - 70.0 * float(row["mean_correction_norm"])
+        - 70.0 * float(row.get("mean_meaningful_correction_norm", row["mean_correction_norm"]))
         - 900.0 * float(row["qp_failure_rate"])
         - 450.0 * float(row["ego_collisions_mean"])
     )
@@ -515,15 +530,18 @@ class RewardAblationEvalCallback(BaseCallback):
 def plot_history(history: pd.DataFrame, output_path: Path, title: str) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(12, 7.0))
     axes = axes.ravel()
+    correction_column = (
+        "mean_meaningful_correction_norm" if "mean_meaningful_correction_norm" in history.columns else "mean_correction_norm"
+    )
     if not history.empty:
         axes[0].plot(history["timesteps"], history["mean_abs_speed_error"], marker="o")
         axes[1].plot(history["timesteps"], history["mean_lat_y_error_m"], marker="o")
         axes[2].plot(history["timesteps"], history["event_intervention_rate"], marker="o")
-        axes[3].plot(history["timesteps"], history["mean_correction_norm"], marker="o")
+        axes[3].plot(history["timesteps"], history[correction_column], marker="o")
     axes[0].set_title("Abs Speed Error")
     axes[1].set_title("Lateral y Error")
     axes[2].set_title("Meaningful Intervention")
-    axes[3].set_title("Mean Correction Norm")
+    axes[3].set_title("Meaningful Correction")
     axes[2].yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0%}"))
     for axis in axes:
         axis.set_xlabel("Training timestep")
@@ -541,11 +559,14 @@ def plot_aggregate(summary: pd.DataFrame, output_path: Path) -> None:
     labels = ranked["trial_name"].tolist()
     y = np.arange(len(labels))
     fig, axes = plt.subplots(1, 4, figsize=(18, max(4.8, 0.5 * len(labels))))
+    correction_column = (
+        "mean_meaningful_correction_norm" if "mean_meaningful_correction_norm" in ranked.columns else "mean_correction_norm"
+    )
     panels = [
         ("mean_abs_speed_error", "Abs Speed Error", False),
         ("mean_lat_y_error_m", "Lateral y Error", False),
         ("event_intervention_rate", "Meaningful Intervention", True),
-        ("mean_correction_norm", "Mean Correction", False),
+        (correction_column, "Meaningful Correction", False),
     ]
     for axis, (column, title, percent) in zip(axes, panels):
         axis.barh(y, ranked[column].to_numpy(dtype=float), color="#1f77b4")

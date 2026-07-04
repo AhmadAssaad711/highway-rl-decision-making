@@ -25,6 +25,7 @@ class CBFGuidedReplayBufferSamples(NamedTuple):
     dones: th.Tensor
     rewards: th.Tensor
     safe_actions: th.Tensor
+    interventions: th.Tensor
 
 
 class CBFGuidedReplayBuffer(ReplayBuffer):
@@ -33,7 +34,9 @@ class CBFGuidedReplayBuffer(ReplayBuffer):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         action_shape = (self.buffer_size, self.n_envs, self.action_dim)
+        scalar_shape = (self.buffer_size, self.n_envs, 1)
         self.safe_actions = np.zeros(action_shape, dtype=np.float32)
+        self.interventions = np.zeros(scalar_shape, dtype=np.float32)
 
     @staticmethod
     def _read_safe_action(info: dict[str, Any]) -> Optional[np.ndarray]:
@@ -54,6 +57,18 @@ class CBFGuidedReplayBuffer(ReplayBuffer):
         scaled = 2.0 * ((np.clip(action_phys, low, high) - low) / np.maximum(high - low, 1e-6)) - 1.0
         return np.clip(scaled, -1.0, 1.0).astype(np.float32)
 
+    @staticmethod
+    def _read_event_intervention(info: dict[str, Any]) -> bool:
+        if "cbf_event_intervened" in info:
+            return bool(info["cbf_event_intervened"])
+        if "intervention" in info:
+            return bool(info["intervention"])
+        correction = info.get("cbf_correction_norm", info.get("correction_norm"))
+        if correction is None:
+            return False
+        threshold = float(info.get("cbf_event_intervention_threshold", 0.03))
+        return bool(float(correction) > threshold)
+
     def add(self, obs, next_obs, action, reward, done, infos) -> None:
         slot = self.pos
         raw_actions_scaled = np.asarray(action, dtype=np.float32).reshape((self.n_envs, self.action_dim))
@@ -63,6 +78,7 @@ class CBFGuidedReplayBuffer(ReplayBuffer):
             safe_phys = self._read_safe_action(info)
             if safe_phys is not None:
                 self.safe_actions[slot, env_idx] = self._to_actor_scale(safe_phys)
+            self.interventions[slot, env_idx, 0] = float(self._read_event_intervention(info))
 
         super().add(obs, next_obs, action, reward, done, infos)
 
@@ -80,6 +96,7 @@ class CBFGuidedReplayBuffer(ReplayBuffer):
             (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
             self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env),
             self.safe_actions[batch_inds, env_indices, :],
+            self.interventions[batch_inds, env_indices, :],
         )
         return CBFGuidedReplayBufferSamples(*tuple(map(self.to_torch, data)))
 
@@ -140,7 +157,7 @@ class GuidedCBFDDPG(DDPG):
                 rl_actor_loss = -self.critic.q1_forward(replay_data.observations, a_pred).mean()
 
                 correction = th.norm(replay_data.safe_actions - replay_data.actions, dim=1, keepdim=True)
-                mask_float = (correction > self.bc_delta).float()
+                mask_float = (replay_data.interventions > 0.5).float()
                 weights = 1.0 + th.clamp(
                     correction / self.bc_action_scale,
                     min=0.0,
