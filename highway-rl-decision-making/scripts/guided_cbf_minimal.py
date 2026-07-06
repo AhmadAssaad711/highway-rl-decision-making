@@ -26,17 +26,23 @@ class CBFGuidedReplayBufferSamples(NamedTuple):
     rewards: th.Tensor
     safe_actions: th.Tensor
     interventions: th.Tensor
+    projection_jacobians: th.Tensor
 
 
 class CBFGuidedReplayBuffer(ReplayBuffer):
-    """Replay buffer with one extra actor-scale CBF target: ``safe_actions``."""
+    """Replay buffer with actor-scale CBF targets and local projection Jacobians."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         action_shape = (self.buffer_size, self.n_envs, self.action_dim)
         scalar_shape = (self.buffer_size, self.n_envs, 1)
+        jacobian_shape = (self.buffer_size, self.n_envs, self.action_dim, self.action_dim)
         self.safe_actions = np.zeros(action_shape, dtype=np.float32)
         self.interventions = np.zeros(scalar_shape, dtype=np.float32)
+        self.projection_jacobians = np.broadcast_to(
+            np.eye(self.action_dim, dtype=np.float32),
+            jacobian_shape,
+        ).copy()
 
     @staticmethod
     def _read_safe_action(info: dict[str, Any]) -> Optional[np.ndarray]:
@@ -69,16 +75,67 @@ class CBFGuidedReplayBuffer(ReplayBuffer):
         threshold = float(info.get("cbf_event_intervention_threshold", 0.03))
         return bool(float(correction) > threshold)
 
+    def _read_projection_jacobian(
+        self,
+        info: dict[str, Any],
+        raw_action_scaled: np.ndarray,
+        safe_action_scaled: np.ndarray,
+        intervened: bool,
+    ) -> np.ndarray:
+        identity = np.eye(self.action_dim, dtype=np.float32)
+
+        for key in ["cbf_projection_jacobian_scaled", "projection_jacobian_scaled"]:
+            if key not in info:
+                continue
+            candidate = np.asarray(info[key], dtype=np.float32)
+            if candidate.shape == identity.shape and np.all(np.isfinite(candidate)):
+                return candidate
+
+        for key in ["cbf_active_constraint_rows_scaled", "active_constraint_rows_scaled"]:
+            if key not in info:
+                continue
+            rows = np.asarray(info[key], dtype=np.float32).reshape(-1, self.action_dim)
+            if rows.size == 0 or not np.all(np.isfinite(rows)):
+                continue
+            gram = rows @ rows.T
+            try:
+                projection = identity - rows.T @ np.linalg.pinv(gram, rcond=1e-5) @ rows
+            except np.linalg.LinAlgError:
+                continue
+            projection = 0.5 * (projection + projection.T)
+            if projection.shape == identity.shape and np.all(np.isfinite(projection)):
+                return projection.astype(np.float32)
+
+        if not intervened:
+            return identity
+
+        correction = np.asarray(raw_action_scaled - safe_action_scaled, dtype=np.float32).reshape(-1)[: self.action_dim]
+        correction_norm = float(np.linalg.norm(correction))
+        if not np.isfinite(correction_norm) or correction_norm <= 1e-6:
+            return identity
+        normal = correction / correction_norm
+        projection = identity - np.outer(normal, normal)
+        return projection.astype(np.float32)
+
     def add(self, obs, next_obs, action, reward, done, infos) -> None:
         slot = self.pos
         raw_actions_scaled = np.asarray(action, dtype=np.float32).reshape((self.n_envs, self.action_dim))
         self.safe_actions[slot] = raw_actions_scaled
 
         for env_idx, info in enumerate(infos):
+            safe_action_scaled = raw_actions_scaled[env_idx]
             safe_phys = self._read_safe_action(info)
             if safe_phys is not None:
-                self.safe_actions[slot, env_idx] = self._to_actor_scale(safe_phys)
-            self.interventions[slot, env_idx, 0] = float(self._read_event_intervention(info))
+                safe_action_scaled = self._to_actor_scale(safe_phys)
+                self.safe_actions[slot, env_idx] = safe_action_scaled
+            intervened = self._read_event_intervention(info)
+            self.interventions[slot, env_idx, 0] = float(intervened)
+            self.projection_jacobians[slot, env_idx] = self._read_projection_jacobian(
+                info,
+                raw_actions_scaled[env_idx],
+                safe_action_scaled,
+                intervened,
+            )
 
         super().add(obs, next_obs, action, reward, done, infos)
 
@@ -97,6 +154,7 @@ class CBFGuidedReplayBuffer(ReplayBuffer):
             self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env),
             self.safe_actions[batch_inds, env_indices, :],
             self.interventions[batch_inds, env_indices, :],
+            self.projection_jacobians[batch_inds, env_indices, :, :],
         )
         return CBFGuidedReplayBufferSamples(*tuple(map(self.to_torch, data)))
 
@@ -111,6 +169,7 @@ class GuidedCBFDDPG(DDPG):
         bc_delta: float = 0.03,
         bc_action_scale: float = 1.0,
         bc_weight_max: float = 5.0,
+        use_projected_q: bool = True,
         **kwargs,
     ) -> None:
         if kwargs.get("replay_buffer_class") is None:
@@ -119,6 +178,7 @@ class GuidedCBFDDPG(DDPG):
         self.bc_delta = float(bc_delta)
         self.bc_action_scale = float(max(bc_action_scale, 1e-6))
         self.bc_weight_max = float(bc_weight_max)
+        self.use_projected_q = bool(use_projected_q)
         super().__init__(*args, **kwargs)
 
     def train(self, gradient_steps: int, batch_size: int = 100) -> None:
@@ -127,6 +187,7 @@ class GuidedCBFDDPG(DDPG):
 
         actor_losses, actor_rl_losses, bc_losses, critic_losses = [], [], [], []
         bc_mask_rates, bc_weight_means = [], []
+        projection_trace_means, projection_active_rates, projected_action_gaps = [], [], []
 
         for _ in range(gradient_steps):
             self._n_updates += 1
@@ -154,7 +215,24 @@ class GuidedCBFDDPG(DDPG):
 
             if self._n_updates % self.policy_delay == 0:
                 a_pred = self.actor(replay_data.observations)
-                rl_actor_loss = -self.critic.q1_forward(replay_data.observations, a_pred).mean()
+                actor_q_action = a_pred
+                if self.use_projected_q and hasattr(replay_data, "projection_jacobians"):
+                    projection_jacobians = replay_data.projection_jacobians.detach()
+                    local_delta = (a_pred - replay_data.actions).unsqueeze(-1)
+                    actor_q_action = replay_data.safe_actions.detach() + th.bmm(projection_jacobians, local_delta).squeeze(-1)
+                    actor_q_action = actor_q_action.clamp(-1.0, 1.0)
+                    projection_identity = th.eye(
+                        actor_q_action.shape[1],
+                        device=actor_q_action.device,
+                        dtype=actor_q_action.dtype,
+                    ).unsqueeze(0)
+                    projection_delta = projection_jacobians - projection_identity
+                    projection_active = th.norm(projection_delta, dim=(1, 2)) > 1e-6
+                    projection_active_rates.append(projection_active.float().mean().item())
+                    projection_trace_means.append(th.diagonal(projection_jacobians, dim1=1, dim2=2).sum(dim=1).mean().item())
+                    projected_action_gaps.append(th.norm(actor_q_action - a_pred, dim=1).mean().item())
+
+                rl_actor_loss = -self.critic.q1_forward(replay_data.observations, actor_q_action).mean()
 
                 correction = th.norm(replay_data.safe_actions - replay_data.actions, dim=1, keepdim=True)
                 mask_float = (replay_data.interventions > 0.5).float()
@@ -192,6 +270,10 @@ class GuidedCBFDDPG(DDPG):
             self.logger.record("train/cbf_bc_loss", np.mean(bc_losses))
             self.logger.record("train/cbf_bc_mask_rate", np.mean(bc_mask_rates))
             self.logger.record("train/cbf_bc_weight", np.mean(bc_weight_means))
+            if projection_trace_means:
+                self.logger.record("train/cbf_projection_trace", np.mean(projection_trace_means))
+                self.logger.record("train/cbf_projection_active_rate", np.mean(projection_active_rates))
+                self.logger.record("train/cbf_projected_action_gap", np.mean(projected_action_gaps))
         self.logger.record("train/critic_loss", np.mean(critic_losses))
 
 
@@ -202,6 +284,7 @@ def install_minimal_guided_cbf(namespace: dict[str, Any]) -> None:
     namespace.setdefault("GUIDED_CBF_BC_DELTA", 0.03)
     namespace.setdefault("GUIDED_CBF_ACTION_SCALE", 1.0)
     namespace.setdefault("GUIDED_CBF_WEIGHT_MAX", 5.0)
+    namespace.setdefault("GUIDED_CBF_USE_PROJECTED_Q", True)
     namespace.setdefault("GUIDED_DDPG_CBF_TOTAL_TIMESTEPS", namespace.get("DDPG_CBF_TOTAL_TIMESTEPS"))
     namespace.setdefault(
         "GUIDED_DDPG_CBF_MODEL_PATH",

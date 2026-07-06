@@ -659,6 +659,9 @@ def train_variant(
                 "lambda_norm": float(args.lambda_norm if env_kind != "baseline" else 0.0),
                 "lambda_event": float(args.lambda_event if env_kind != "baseline" else 0.0),
                 "event_threshold": float(args.event_threshold),
+                "projected_q": bool(namespace.get("GUIDED_CBF_USE_PROJECTED_Q", False))
+                if variant_cfg.get("model_class_name") == "GuidedCBFDDPG"
+                else False,
                 "task_distance_m": float(args.task_distance_m),
                 "task_max_steps": int(args.task_max_steps),
             },
@@ -682,6 +685,7 @@ def train_variant(
                     "bc_delta": namespace["GUIDED_CBF_BC_DELTA"],
                     "bc_action_scale": namespace["GUIDED_CBF_ACTION_SCALE"],
                     "bc_weight_max": namespace["GUIDED_CBF_WEIGHT_MAX"],
+                    "use_projected_q": namespace["GUIDED_CBF_USE_PROJECTED_Q"],
                 }
             )
         model = model_cls(
