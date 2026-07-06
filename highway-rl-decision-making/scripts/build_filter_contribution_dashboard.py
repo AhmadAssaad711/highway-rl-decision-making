@@ -10,6 +10,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -174,6 +175,20 @@ DIAGNOSTIC_KPIS: list[dict[str, Any]] = [
     },
 ]
 
+TRAIN_EPISODE_SOURCE_TAGS = {
+    "return_mean": "01_task/episode_return",
+    "episode_length_steps_mean": "01_task/episode_length_steps",
+    "ego_collisions_per_km_mean": "02_safety/ego_collisions_per_km",
+    "h_min": "02_safety/h_min",
+    "qp_failure_rate_mean": "02_safety/qp_failure_rate",
+    "mean_abs_speed_error_mean": "03_efficiency/abs_speed_deviation_mps",
+    "event_intervention_rate_mean": "05_filter/intervention_rate",
+    "mean_correction_norm_mean": "05_filter/correction_norm_mean",
+    "mean_neighbor_density_per_km_mean": "06_traffic/neighbor_density_per_km",
+    "_progress_distance_m": "03_efficiency/distance_traveled_m",
+    "_progress_time_s": "01_task/episode_time_s",
+}
+
 
 def clean_value(value: Any) -> float | None:
     try:
@@ -181,6 +196,50 @@ def clean_value(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return scalar if np.isfinite(scalar) else None
+
+
+def read_training_episode_tensorboard(source_dir: Path) -> pd.DataFrame:
+    candidate_roots = [
+        source_dir / "tb" / "custom",
+        source_dir.parent / "tb" / "custom",
+    ]
+    tb_root = next((root for root in candidate_roots if root.exists()), None)
+    if tb_root is None:
+        return pd.DataFrame()
+
+    wanted_tags: dict[str, tuple[str, str]] = {}
+    for variant in VARIANT_RUN_NAMES:
+        for column, source_tag in TRAIN_EPISODE_SOURCE_TAGS.items():
+            wanted_tags[f"train_episode/{variant}/{source_tag}"] = (variant, column)
+
+    values_by_key: dict[tuple[str, int, str], list[float]] = {}
+    for event_file in tb_root.rglob("events.out.tfevents*"):
+        accumulator = EventAccumulator(str(event_file), size_guidance={"scalars": 0})
+        accumulator.Reload()
+        for full_tag in set(accumulator.Tags().get("scalars", [])).intersection(wanted_tags):
+            variant, column = wanted_tags[full_tag]
+            for event in accumulator.Scalars(full_tag):
+                values_by_key.setdefault((variant, int(event.step), column), []).append(float(event.value))
+
+    if not values_by_key:
+        return pd.DataFrame()
+
+    rows_by_key: dict[tuple[str, int], dict[str, float | str]] = {}
+    for (variant, step, column), values in values_by_key.items():
+        key = (variant, step)
+        rows_by_key.setdefault(key, {"variant": variant, "checkpoint_step": float(step)})
+        rows_by_key[key][column] = float(np.mean(values))
+
+    rows: list[dict[str, float | str]] = []
+    for row in rows_by_key.values():
+        distance = clean_value(row.get("_progress_distance_m"))
+        time_s = clean_value(row.get("_progress_time_s"))
+        if distance is not None and time_s is not None and time_s > 1e-9:
+            row["progress_rate_mps_mean"] = float(distance / time_s)
+        rows.append(row)
+
+    frame = pd.DataFrame(rows)
+    return frame.sort_values(["variant", "checkpoint_step"]).reset_index(drop=True)
 
 
 def load_summary(source_dir: Path) -> pd.DataFrame:
@@ -230,7 +289,12 @@ def row_value(row: pd.Series, spec: dict[str, Any]) -> float | None:
     return clean_value(row.get(fallback))
 
 
-def write_tensorboard(summary: pd.DataFrame, diagnostics: pd.DataFrame, output_dir: Path) -> None:
+def write_tensorboard(
+    during_training: pd.DataFrame,
+    summary: pd.DataFrame,
+    diagnostics: pd.DataFrame,
+    output_dir: Path,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     index_text = "\n".join(
         [
@@ -238,11 +302,17 @@ def write_tensorboard(summary: pd.DataFrame, diagnostics: pd.DataFrame, output_d
             "",
             "Runs are policy/execution-mode pairs; tags are shared, so TensorBoard overlays comparable lines on one KPI chart.",
             "",
+            "Use `during_training/*` for real episode-level KPI traces emitted while each policy was learning.",
             "Use `checkpoint/*` for the 10 headline KPIs over checkpoint.",
             "Use `diagnostics/*` for raw-vs-filtered and actor-vs-random-CBF attribution.",
+            "QP failure rate may be absent under `during_training/*` when the training episode stream did not record it; it remains available under checkpoint attribution.",
             "",
             "| Section | KPI | Direction |",
             "|---|---|---|",
+            *[
+                f"| during_training | `{spec['tag']}` | {spec['direction']} |"
+                for spec in HEADLINE_KPIS
+            ],
             *[
                 f"| checkpoint | `{spec['tag']}` | {spec['direction']} |"
                 for spec in HEADLINE_KPIS
@@ -253,6 +323,20 @@ def write_tensorboard(summary: pd.DataFrame, diagnostics: pd.DataFrame, output_d
             ],
         ]
     )
+
+    for variant, frame in during_training.groupby("variant", dropna=False):
+        variant = str(variant)
+        run_name = f"training/{VARIANT_RUN_NAMES.get(variant, variant)}"
+        writer = SummaryWriter(log_dir=str(output_dir / run_name))
+        for _, row in frame.sort_values("checkpoint_step").iterrows():
+            step = int(clean_value(row.get("checkpoint_step")) or 0)
+            for spec in HEADLINE_KPIS:
+                value = row_value(row, spec)
+                if value is not None:
+                    writer.add_scalar(f"during_training/{spec['tag']}", value, step)
+        writer.add_text("00_index", index_text, 0)
+        writer.flush()
+        writer.close()
 
     for (variant, mode), frame in summary.groupby(["variant", "mode"], dropna=False):
         variant = str(variant)
@@ -282,6 +366,39 @@ def write_tensorboard(summary: pd.DataFrame, diagnostics: pd.DataFrame, output_d
         writer.add_text("00_index", index_text, 0)
         writer.flush()
         writer.close()
+
+
+def plot_during_training(during_training: pd.DataFrame, output_path: Path) -> None:
+    fig, axes = plt.subplots(5, 2, figsize=(14, 17), sharex=True)
+    for axis, spec in zip(axes.ravel(), HEADLINE_KPIS):
+        any_data = False
+        for variant in VARIANT_RUN_NAMES:
+            frame = during_training[during_training["variant"] == variant].sort_values("checkpoint_step")
+            if frame.empty or spec["column"] not in frame.columns:
+                continue
+            values = pd.to_numeric(frame[spec["column"]], errors="coerce")
+            if values.notna().sum() == 0:
+                continue
+            smoothed = values.rolling(window=25, min_periods=1).mean()
+            axis.plot(
+                frame["checkpoint_step"],
+                smoothed,
+                linewidth=1.8,
+                color=VARIANT_COLORS.get(variant),
+                label=VARIANT_LABELS.get(variant, variant),
+            )
+            any_data = True
+        axis.set_title(spec["title"])
+        axis.set_xlabel("Training timestep")
+        axis.grid(True, alpha=0.25)
+        if not any_data:
+            axis.text(0.5, 0.5, "not in explicit training stream", ha="center", va="center", transform=axis.transAxes)
+    axes[0, 0].legend(loc="best", fontsize=9)
+    fig.suptitle("CBF Isolation Study: KPIs During Policy Training", fontsize=14)
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
 
 
 def plot_headline(summary: pd.DataFrame, output_path: Path) -> None:
@@ -348,16 +465,27 @@ def plot_diagnostics(diagnostics: pd.DataFrame, output_path: Path) -> None:
     plt.close(fig)
 
 
-def write_clean_csvs(summary: pd.DataFrame, diagnostics: pd.DataFrame, output_dir: Path) -> None:
+def write_clean_csvs(
+    during_training: pd.DataFrame,
+    summary: pd.DataFrame,
+    diagnostics: pd.DataFrame,
+    output_dir: Path,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    training_cols = ["variant", "checkpoint_step"]
+    for spec in HEADLINE_KPIS:
+        for column in [spec["column"], spec.get("fallback_column")]:
+            if column and column in during_training.columns and column not in training_cols:
+                training_cols.append(column)
     headline_cols = ["variant", "checkpoint_step", "mode", "mode_label"]
     for spec in HEADLINE_KPIS:
         for column in [spec["column"], spec.get("fallback_column")]:
             if column and column in summary.columns and column not in headline_cols:
                 headline_cols.append(column)
-    summary[headline_cols].to_csv(output_dir / "headline_filter_contribution.csv", index=False)
+    during_training[training_cols].to_csv(output_dir / "during_training.csv", index=False)
+    summary[headline_cols].to_csv(output_dir / "headline.csv", index=False)
     if not diagnostics.empty:
-        diagnostics.to_csv(output_dir / "diagnostics_filter_contribution.csv", index=False)
+        diagnostics.to_csv(output_dir / "diagnostics.csv", index=False)
 
 
 def parse_args() -> argparse.Namespace:
@@ -378,17 +506,20 @@ def main() -> int:
     output_dir = (args.output_dir or source_dir / "headline_kpis").resolve()
     tb_dir = args.tensorboard_dir.resolve()
 
+    during_training = read_training_episode_tensorboard(source_dir)
     summary = load_summary(source_dir)
     diagnostics = load_diagnostics(source_dir)
-    write_tensorboard(summary, diagnostics, tb_dir)
-    plot_headline(summary, output_dir / "headline_filter_contribution.png")
-    plot_diagnostics(diagnostics, output_dir / "diagnostics_filter_contribution.png")
-    write_clean_csvs(summary, diagnostics, output_dir)
+    write_tensorboard(during_training, summary, diagnostics, tb_dir)
+    plot_during_training(during_training, output_dir / "during_training.png")
+    plot_headline(summary, output_dir / "headline.png")
+    plot_diagnostics(diagnostics, output_dir / "diagnostics.png")
+    write_clean_csvs(during_training, summary, diagnostics, output_dir)
 
     print(f"[filter-dashboard] tensorboard={tb_dir}")
     print(f"[filter-dashboard] output={output_dir}")
-    print(f"[filter-dashboard] headline_plot={output_dir / 'headline_filter_contribution.png'}")
-    print(f"[filter-dashboard] diagnostics_plot={output_dir / 'diagnostics_filter_contribution.png'}")
+    print(f"[filter-dashboard] during_training_plot={output_dir / 'during_training.png'}")
+    print(f"[filter-dashboard] headline_plot={output_dir / 'headline.png'}")
+    print(f"[filter-dashboard] diagnostics_plot={output_dir / 'diagnostics.png'}")
     return 0
 
 

@@ -118,6 +118,20 @@ SOURCE_EVAL_TAGS = {
     "mean_neighbor_density_per_km": "06_traffic/neighbor_density_per_km",
 }
 
+TRAIN_EPISODE_SOURCE_TAGS = {
+    "return_mean": "01_task/episode_return",
+    "episode_length_steps_mean": "01_task/episode_length_steps",
+    "ego_collisions_per_km_mean": "02_safety/ego_collisions_per_km",
+    "h_min": "02_safety/h_min",
+    "qp_failure_rate": "02_safety/qp_failure_rate",
+    "mean_abs_speed_error": "03_efficiency/abs_speed_deviation_mps",
+    "event_intervention_rate": "05_filter/intervention_rate",
+    "mean_correction_norm": "05_filter/correction_norm_mean",
+    "mean_neighbor_density_per_km": "06_traffic/neighbor_density_per_km",
+    "_progress_distance_m": "03_efficiency/distance_traveled_m",
+    "_progress_time_s": "01_task/episode_time_s",
+}
+
 
 def read_history(source_dir: Path, variant: str) -> pd.DataFrame:
     path = source_dir / variant / "train_eval_history.csv"
@@ -159,6 +173,46 @@ def read_source_tensorboard_eval(source_dir: Path) -> pd.DataFrame:
         rows_by_key.setdefault(key, {"variant": variant, "timesteps": float(step)})
         rows_by_key[key][column] = float(np.mean(values))
     frame = pd.DataFrame(rows_by_key.values())
+    return frame.sort_values(["variant", "timesteps"]).reset_index(drop=True)
+
+
+def read_training_episode_tensorboard(source_dir: Path) -> pd.DataFrame:
+    tb_root = source_dir / "tb" / "custom"
+    if not tb_root.exists():
+        return pd.DataFrame()
+
+    wanted_tags: dict[str, tuple[str, str]] = {}
+    for variant, run_name in RUN_NAMES.items():
+        for column, source_tag in TRAIN_EPISODE_SOURCE_TAGS.items():
+            wanted_tags[f"train_episode/{variant}/{source_tag}"] = (variant, column)
+
+    values_by_key: dict[tuple[str, int, str], list[float]] = {}
+    for event_file in tb_root.rglob("events.out.tfevents*"):
+        accumulator = EventAccumulator(str(event_file), size_guidance={"scalars": 0})
+        accumulator.Reload()
+        for full_tag in set(accumulator.Tags().get("scalars", [])).intersection(wanted_tags):
+            variant, column = wanted_tags[full_tag]
+            for event in accumulator.Scalars(full_tag):
+                values_by_key.setdefault((variant, int(event.step), column), []).append(float(event.value))
+
+    if not values_by_key:
+        return pd.DataFrame()
+
+    rows_by_key: dict[tuple[str, int], dict[str, float | str]] = {}
+    for (variant, step, column), values in values_by_key.items():
+        key = (variant, step)
+        rows_by_key.setdefault(key, {"variant": variant, "timesteps": float(step)})
+        rows_by_key[key][column] = float(np.mean(values))
+
+    rows: list[dict[str, float | str]] = []
+    for row in rows_by_key.values():
+        distance = clean_value(row.get("_progress_distance_m"))
+        time_s = clean_value(row.get("_progress_time_s"))
+        if distance is not None and time_s is not None and time_s > 1e-9:
+            row["progress_rate_mps_mean"] = float(distance / time_s)
+        rows.append(row)
+
+    frame = pd.DataFrame(rows)
     return frame.sort_values(["variant", "timesteps"]).reset_index(drop=True)
 
 
@@ -226,6 +280,7 @@ def append_terminal_final_eval(train_history: pd.DataFrame, final_summary: pd.Da
 
 def write_tensorboard(
     *,
+    during_training: pd.DataFrame,
     train_history: pd.DataFrame,
     final_summary: pd.DataFrame,
     output_dir: Path,
@@ -233,12 +288,20 @@ def write_tensorboard(
     output_dir.mkdir(parents=True, exist_ok=True)
     for variant, run_name in RUN_NAMES.items():
         writer = SummaryWriter(log_dir=str(output_dir / run_name))
+        training = during_training[during_training["variant"] == variant].sort_values("timesteps")
         history = train_history[train_history["variant"] == variant].sort_values("timesteps")
         final_rows = final_summary[final_summary["variant"] == variant]
         if final_rows.empty:
             continue
         final_row = final_rows.iloc[0]
         final_step = int(clean_value(final_row.get("timesteps")) or clean_value(history["timesteps"].max()) or 0)
+
+        for _, row in training.iterrows():
+            step = int(clean_value(row.get("timesteps")) or 0)
+            for spec in HEADLINE_KPIS:
+                value = clean_value(row.get(spec["column"]))
+                if value is not None:
+                    writer.add_scalar(f"during_training/{spec['tag']}", value, step)
 
         for _, row in history.iterrows():
             step = int(clean_value(row.get("timesteps")) or 0)
@@ -260,9 +323,11 @@ def write_tensorboard(
                     "",
                     "Runs are agents; tags are shared across agents, so TensorBoard overlays them on the same graph.",
                     "",
+                    "Use `during_training/*` for real episode-level KPI traces emitted while learning.",
                     "Use `train_eval/*` to see evolution over training.",
                     "Use `final_eval/*` for the 50-episode final evaluation point.",
                     "If one run missed only the terminal training-eval checkpoint, the terminal point is filled from final eval so every line reaches the same endpoint.",
+                    "QP failure rate may be absent under `during_training/*` when the training episode stream did not record it; it remains available under eval sections.",
                     "",
                     "| Group | KPI | Direction |",
                     "|---|---|---|",
@@ -276,6 +341,39 @@ def write_tensorboard(
         )
         writer.flush()
         writer.close()
+
+
+def plot_during_training(during_training: pd.DataFrame, output_path: Path) -> None:
+    fig, axes = plt.subplots(5, 2, figsize=(14, 17), sharex=True)
+    for axis, spec in zip(axes.ravel(), HEADLINE_KPIS):
+        any_data = False
+        for variant in RUN_NAMES:
+            history = during_training[during_training["variant"] == variant].sort_values("timesteps")
+            if history.empty or spec["column"] not in history.columns:
+                continue
+            values = pd.to_numeric(history[spec["column"]], errors="coerce")
+            if values.notna().sum() == 0:
+                continue
+            smoothed = values.rolling(window=25, min_periods=1).mean()
+            axis.plot(
+                history["timesteps"],
+                smoothed,
+                linewidth=1.8,
+                color=COLORS.get(variant),
+                label=LABELS.get(variant, variant),
+            )
+            any_data = True
+        axis.set_title(spec["title"])
+        axis.grid(True, alpha=0.25)
+        axis.set_xlabel("Training timesteps")
+        if not any_data:
+            axis.text(0.5, 0.5, "not in explicit training stream", ha="center", va="center", transform=axis.transAxes)
+    axes[0, 0].legend(loc="best", fontsize=9)
+    fig.suptitle("Headline KPIs During Training Episodes (Rolling Mean)", fontsize=14)
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
 
 
 def plot_training(train_history: pd.DataFrame, output_path: Path) -> None:
@@ -328,12 +426,20 @@ def plot_final(final_summary: pd.DataFrame, output_path: Path) -> None:
     plt.close(fig)
 
 
-def write_clean_csvs(train_history: pd.DataFrame, final_summary: pd.DataFrame, output_dir: Path) -> None:
+def write_clean_csvs(
+    during_training: pd.DataFrame,
+    train_history: pd.DataFrame,
+    final_summary: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    training_cols = ["variant", "timesteps", *[spec["column"] for spec in HEADLINE_KPIS]]
     train_cols = ["variant", "timesteps", *[spec["column"] for spec in HEADLINE_KPIS]]
     final_cols = ["variant", "timesteps", *[spec["final_column"] for spec in HEADLINE_KPIS]]
+    training_cols = list(dict.fromkeys([col for col in training_cols if col in during_training.columns]))
     train_cols = list(dict.fromkeys([col for col in train_cols if col in train_history.columns]))
     final_cols = list(dict.fromkeys([col for col in final_cols if col in final_summary.columns]))
     output_dir.mkdir(parents=True, exist_ok=True)
+    during_training[training_cols].to_csv(output_dir / "headline_during_training.csv", index=False)
     train_history[train_cols].to_csv(output_dir / "headline_train_eval.csv", index=False)
     final_summary[final_cols].to_csv(output_dir / "headline_final_eval.csv", index=False)
 
@@ -351,6 +457,7 @@ def main() -> int:
     source_dir = args.source_dir.resolve()
     output_dir = (args.output_dir or source_dir / "headline_kpis").resolve()
     tb_dir = args.tensorboard_dir.resolve()
+    during_training = read_training_episode_tensorboard(source_dir)
     train_history = load_train_eval(source_dir)
     final_summary_path = source_dir / "summary.csv"
     if not final_summary_path.exists():
@@ -358,13 +465,20 @@ def main() -> int:
     final_summary = pd.read_csv(final_summary_path)
     train_history = append_terminal_final_eval(train_history, final_summary)
 
-    write_tensorboard(train_history=train_history, final_summary=final_summary, output_dir=tb_dir)
+    write_tensorboard(
+        during_training=during_training,
+        train_history=train_history,
+        final_summary=final_summary,
+        output_dir=tb_dir,
+    )
+    plot_during_training(during_training, output_dir / "headline_during_training.png")
     plot_training(train_history, output_dir / "headline_train_eval.png")
     plot_final(final_summary, output_dir / "headline_final_eval.png")
-    write_clean_csvs(train_history, final_summary, output_dir)
+    write_clean_csvs(during_training, train_history, final_summary, output_dir)
 
     print(f"[headline-kpis] tensorboard={tb_dir}")
     print(f"[headline-kpis] output={output_dir}")
+    print(f"[headline-kpis] during_training_plot={output_dir / 'headline_during_training.png'}")
     print(f"[headline-kpis] train_plot={output_dir / 'headline_train_eval.png'}")
     print(f"[headline-kpis] final_plot={output_dir / 'headline_final_eval.png'}")
     return 0

@@ -536,6 +536,8 @@ class LaneFreeTrafficEnv(AbstractEnv):
     def _mtm_controller(self, vehicle: LaneFreeVehicle, vehicles: list[LaneFreeVehicle]) -> tuple[float, float, dict[str, float]]:
         params = self._mtm_params_for_vehicle(vehicle)
         free_accel = self._mtm_free_acceleration(vehicle, params)
+        if not np.isfinite(free_accel):
+            free_accel = 0.0
         strongest_traffic = 0.0
         desired_vy = 0.0
         best_abs_traffic = -np.inf
@@ -546,6 +548,17 @@ class LaneFreeTrafficEnv(AbstractEnv):
         for other in vehicles:
             if other is vehicle:
                 continue
+            if not (
+                np.isfinite(vehicle.position[0])
+                and np.isfinite(vehicle.position[1])
+                and np.isfinite(other.position[0])
+                and np.isfinite(other.position[1])
+                and np.isfinite(vehicle.vx)
+                and np.isfinite(vehicle.vy)
+                and np.isfinite(other.vx)
+                and np.isfinite(other.vy)
+            ):
+                continue
             dx = self._forward_distance(vehicle.position[0], other.position[0])
             if not (0.0 < dx < leader_range):
                 continue
@@ -553,14 +566,24 @@ class LaneFreeTrafficEnv(AbstractEnv):
             gap_x = max(dx - 0.5 * (vehicle.length + other.length), 0.05)
             dy = float(other.position[1] - vehicle.position[1])
             lateral_gap = self._mtm_lateral_gap(vehicle, other, params, theta_key="theta")
+            if not (np.isfinite(gap_x) and np.isfinite(dy) and np.isfinite(lateral_gap)):
+                continue
             alpha = min(float(np.exp(-lateral_gap / max(float(params["s_y0"]), 1e-6))), 1.0)
             alpha_tilde = min(float(np.exp(-lateral_gap / max(float(params["tilde_s_y0"]), 1e-6))), 1.0)
+            if not (np.isfinite(alpha) and np.isfinite(alpha_tilde)):
+                continue
             if alpha <= 1e-6 and alpha_tilde <= 1e-6:
                 continue
 
             car_following = self._mtm_car_following_acceleration(vehicle, other, gap_x, params)
+            if not np.isfinite(car_following):
+                continue
             interaction = car_following - free_accel
+            if not np.isfinite(interaction):
+                continue
             traffic = alpha * interaction
+            if not np.isfinite(traffic):
+                continue
             if abs(traffic) > best_abs_traffic:
                 strongest_traffic = traffic
                 best_abs_traffic = abs(traffic)
@@ -574,7 +597,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
             relative_lateral_factor = 1.0 - float(params["lambda_delta_vy"]) * (other.vy - vehicle.vy) * np.sign(dy)
             relative_lateral_factor = float(np.clip(relative_lateral_factor, 0.0, 2.5))
             politeness_scale = float(np.clip(1.0 - 0.25 * float(params["p"]), 0.5, 1.2))
-            desired_vy += (
+            lateral_vy_increment = (
                 float(params["lambda"])
                 * politeness_scale
                 * alpha_tilde
@@ -582,6 +605,8 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 * away_direction
                 * relative_lateral_factor
             )
+            if np.isfinite(lateral_vy_increment):
+                desired_vy += lateral_vy_increment
 
         ax = free_accel + strongest_traffic
         ay = (desired_vy - float(vehicle.vy)) / max(float(params["tau"]), 1e-6) + self._boundary_force(vehicle)
@@ -640,14 +665,28 @@ class LaneFreeTrafficEnv(AbstractEnv):
         desired_speed = max(float(vehicle.desired_speed), 1e-6)
         a_max = max(float(params["a_max"]), 1e-6)
         comfortable_decel = max(float(params["comfortable_decel"]), 1e-6)
-        delta_v = float(vehicle.vx - leader.vx)
-        dynamic_gap = vehicle.vx * float(params["time_gap"]) + (
-            vehicle.vx * delta_v / (2.0 * np.sqrt(a_max * comfortable_decel))
+        vx = float(vehicle.vx)
+        leader_vx = float(leader.vx)
+        gap_x = float(gap_x)
+        time_gap = float(params["time_gap"])
+        min_gap = float(params["min_gap"])
+        if not all(np.isfinite(value) for value in [desired_speed, a_max, comfortable_decel, vx, leader_vx, gap_x, time_gap, min_gap]):
+            return 0.0
+        delta_v = vx - leader_vx
+        dynamic_gap = vx * time_gap + (
+            vx * delta_v / (2.0 * np.sqrt(a_max * comfortable_decel))
         )
-        desired_gap = float(params["min_gap"]) + max(0.0, dynamic_gap)
-        speed_term = (max(float(vehicle.vx), 0.0) / desired_speed) ** 4
+        if not np.isfinite(dynamic_gap):
+            dynamic_gap = 0.0
+        desired_gap = min_gap + max(0.0, dynamic_gap)
+        if not np.isfinite(desired_gap):
+            desired_gap = min_gap
+        speed_ratio = np.clip(max(vx, 0.0) / desired_speed, 0.0, 10.0)
+        speed_term = float(speed_ratio**4)
         gap_term = (desired_gap / max(float(gap_x), 0.05)) ** 2
-        return float(a_max * (1.0 - speed_term - gap_term))
+        if not np.isfinite(gap_term):
+            gap_term = 1e6
+        return float(np.clip(a_max * (1.0 - speed_term - gap_term), -50.0, 50.0))
 
     def _mtm_lateral_gap(
         self,
@@ -720,6 +759,13 @@ class LaneFreeTrafficEnv(AbstractEnv):
         for i, first in enumerate(vehicles):
             first.crashed = False
             for j, second in enumerate(vehicles[i + 1 :], start=i + 1):
+                if not (
+                    np.isfinite(first.position[0])
+                    and np.isfinite(first.position[1])
+                    and np.isfinite(second.position[0])
+                    and np.isfinite(second.position[1])
+                ):
+                    continue
                 dx = abs(self._signed_distance(first.position[0], second.position[0]))
                 dy = abs(float(second.position[1] - first.position[1]))
                 if dx < 0.5 * (first.length + second.length) and dy < 0.5 * (first.width + second.width):
@@ -843,10 +889,15 @@ class LaneFreeTrafficEnv(AbstractEnv):
         )
 
     def _forward_distance(self, x_from: float, x_to: float) -> float:
-        return float((x_to - x_from) % float(self.config["road_length"]))
+        road_length = float(self.config["road_length"])
+        if not (np.isfinite(x_from) and np.isfinite(x_to) and np.isfinite(road_length) and road_length > 1e-9):
+            return 0.0
+        return float((x_to - x_from) % road_length)
 
     def _signed_distance(self, x_from: float, x_to: float) -> float:
         road_length = float(self.config["road_length"])
+        if not (np.isfinite(x_from) and np.isfinite(x_to) and np.isfinite(road_length) and road_length > 1e-9):
+            return 0.0
         return float(((x_to - x_from + 0.5 * road_length) % road_length) - 0.5 * road_length)
 
     def _distance_to_ego(self, vehicle: LaneFreeVehicle) -> float:
