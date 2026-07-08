@@ -80,11 +80,13 @@ def install_event_penalty_env(namespace: dict[str, Any]) -> None:
             self,
             *args,
             lambda_event: float = 0.0,
+            lambda_raw_violation: float = 0.0,
             intervention_threshold: float = 0.03,
             **kwargs,
         ) -> None:
             super().__init__(*args, **kwargs)
             self.lambda_event = float(lambda_event)
+            self.lambda_raw_violation = float(lambda_raw_violation)
             self.intervention_threshold = float(intervention_threshold)
 
         def step(self, action):
@@ -96,7 +98,9 @@ def install_event_penalty_env(namespace: dict[str, Any]) -> None:
             raw_norm_penalty = float(info.get("cbf_filter_reward_penalty", self.lambda_filter * correction_norm**2))
             norm_penalty = float(self.lambda_filter * meaningful_correction_norm**2)
             event_penalty = float(self.lambda_event * float(event_intervened))
-            reward = float(reward) + raw_norm_penalty - norm_penalty - event_penalty
+            raw_constraint_violation = float(max(float(info.get("cbf_max_constraint_violation_rl", 0.0)), 0.0))
+            raw_violation_penalty = float(self.lambda_raw_violation * raw_constraint_violation**2)
+            reward = float(reward) + raw_norm_penalty - norm_penalty - event_penalty - raw_violation_penalty
 
             raw_action = np.asarray(
                 [info.get("cbf_a_rl_x", 0.0), info.get("cbf_a_rl_y", 0.0)],
@@ -123,7 +127,9 @@ def install_event_penalty_env(namespace: dict[str, Any]) -> None:
                     "cbf_filter_raw_norm_reward_penalty": raw_norm_penalty,
                     "cbf_filter_norm_reward_penalty": norm_penalty,
                     "cbf_filter_event_reward_penalty": event_penalty,
-                    "cbf_filter_reward_penalty": norm_penalty + event_penalty,
+                    "cbf_filter_raw_violation": raw_constraint_violation,
+                    "cbf_filter_raw_violation_reward_penalty": raw_violation_penalty,
+                    "cbf_filter_reward_penalty": norm_penalty + event_penalty + raw_violation_penalty,
                 }
             )
             return obs, reward, terminated, truncated, info
@@ -137,6 +143,7 @@ def install_event_penalty_env(namespace: dict[str, Any]) -> None:
         k0: float,
         k1: float,
         eps_side: float,
+        lambda_raw_violation: float = 0.0,
         render_mode: str | None = None,
         env_config: dict[str, Any] | None = None,
         reward_config: dict[str, float] | None = None,
@@ -152,6 +159,7 @@ def install_event_penalty_env(namespace: dict[str, Any]) -> None:
             env,
             lambda_filter=float(lambda_norm),
             lambda_event=float(lambda_event),
+            lambda_raw_violation=float(lambda_raw_violation),
             intervention_threshold=float(event_threshold),
             eps_side=float(eps_side),
             k0=float(k0),
@@ -176,6 +184,7 @@ def install_event_penalty_env(namespace: dict[str, Any]) -> None:
         k1: float,
         eps_side: float,
         n_envs: int,
+        lambda_raw_violation: float = 0.0,
         use_subproc: bool = False,
         env_config: dict[str, Any] | None = None,
         reward_config: dict[str, float] | None = None,
@@ -186,6 +195,7 @@ def install_event_penalty_env(namespace: dict[str, Any]) -> None:
                 seed=env_seed,
                 lambda_norm=lambda_norm,
                 lambda_event=lambda_event,
+                lambda_raw_violation=lambda_raw_violation,
                 event_threshold=event_threshold,
                 k0=k0,
                 k1=k1,

@@ -594,8 +594,13 @@ class LaneFreeTrafficEnv(AbstractEnv):
             if obstruction <= 0.0:
                 continue
             away_direction = self._mtm_away_direction(vehicle, other, dy)
-            relative_lateral_factor = 1.0 - float(params["lambda_delta_vy"]) * (other.vy - vehicle.vy) * np.sign(dy)
-            relative_lateral_factor = float(np.clip(relative_lateral_factor, 0.0, 2.5))
+            dy_sign = 1.0 if dy > 0.0 else -1.0 if dy < 0.0 else 0.0
+            relative_vy = float(other.vy) - float(vehicle.vy)
+            lambda_delta_vy = float(params.get("lambda_delta_vy", 0.0))
+            if not all(np.isfinite(value) for value in [away_direction, relative_vy, lambda_delta_vy, dy_sign]):
+                continue
+            relative_lateral_factor = 1.0 - lambda_delta_vy * relative_vy * dy_sign
+            relative_lateral_factor = float(min(max(relative_lateral_factor, 0.0), 2.5))
             politeness_scale = float(np.clip(1.0 - 0.25 * float(params["p"]), 0.5, 1.2))
             lateral_vy_increment = (
                 float(params["lambda"])
@@ -756,23 +761,44 @@ class LaneFreeTrafficEnv(AbstractEnv):
         active_pairs: set[tuple[int, int]] = set()
         ego_collision = False
         vehicles = self.road.vehicles
-        for i, first in enumerate(vehicles):
-            first.crashed = False
-            for j, second in enumerate(vehicles[i + 1 :], start=i + 1):
-                if not (
-                    np.isfinite(first.position[0])
-                    and np.isfinite(first.position[1])
-                    and np.isfinite(second.position[0])
-                    and np.isfinite(second.position[1])
-                ):
+        snapshots: list[tuple[float, float, float, float, bool] | None] = []
+        for vehicle in vehicles:
+            vehicle.crashed = False
+            try:
+                x = float(vehicle.position[0])
+                y = float(vehicle.position[1])
+                length = float(vehicle.length)
+                width = float(vehicle.width)
+            except (TypeError, ValueError, IndexError):
+                snapshots.append(None)
+                continue
+            if not all(np.isfinite(value) for value in [x, y, length, width]):
+                snapshots.append(None)
+                continue
+            snapshots.append((x, y, length, width, bool(vehicle.is_ego)))
+
+        crashed_indices: set[int] = set()
+        for i, first_snapshot in enumerate(snapshots):
+            if first_snapshot is None:
+                continue
+            first_x, first_y, first_length, first_width, first_is_ego = first_snapshot
+            for j in range(i + 1, len(snapshots)):
+                second_snapshot = snapshots[j]
+                if second_snapshot is None:
                     continue
-                dx = abs(self._signed_distance(first.position[0], second.position[0]))
-                dy = abs(float(second.position[1] - first.position[1]))
-                if dx < 0.5 * (first.length + second.length) and dy < 0.5 * (first.width + second.width):
+                second_x, second_y, second_length, second_width, second_is_ego = second_snapshot
+                dx = abs(self._signed_distance(first_x, second_x))
+                dy = abs(second_y - first_y)
+                if not (np.isfinite(dx) and np.isfinite(dy)):
+                    continue
+                if dx < 0.5 * (first_length + second_length) and dy < 0.5 * (first_width + second_width):
                     active_pairs.add((i, j))
-                    first.crashed = True
-                    second.crashed = True
-                    ego_collision = ego_collision or first.is_ego or second.is_ego
+                    crashed_indices.update([i, j])
+                    ego_collision = ego_collision or first_is_ego or second_is_ego
+
+        for index in crashed_indices:
+            if 0 <= index < len(vehicles):
+                vehicles[index].crashed = True
 
         new_pairs = active_pairs - self._active_collision_pairs
         self._last_collision_count = len(new_pairs)

@@ -72,12 +72,45 @@ VARIANTS = [
         "model_class_name": "GuidedCBFDDPG",
         "lambda_bc": 0.03,
     },
+    {
+        "variant": "update_a_raw_q_raw_bc",
+        "video_variant": "guided-ddpg-cbf",
+        "label": "A: Q(s, raw) + actor raw + BC",
+        "env_kind": "event_cbf",
+        "model_class_name": "GuidedCBFDDPG",
+        "lambda_bc": 0.03,
+        "critic_action_mode": "raw",
+        "actor_action_mode": "raw",
+    },
+    {
+        "variant": "update_b_safe_critic_raw_actor",
+        "video_variant": "guided-ddpg-cbf",
+        "label": "B: Q(s, safe replay) + actor raw + BC",
+        "env_kind": "event_cbf",
+        "model_class_name": "GuidedCBFDDPG",
+        "lambda_bc": 0.03,
+        "critic_action_mode": "safe",
+        "actor_action_mode": "raw",
+    },
+    {
+        "variant": "update_c_safe_critic_diff_actor",
+        "video_variant": "guided-ddpg-cbf",
+        "label": "C: Q(s, safe replay) + actor diff-CBF",
+        "env_kind": "event_cbf",
+        "model_class_name": "GuidedCBFDDPG",
+        "lambda_bc": 0.03,
+        "critic_action_mode": "safe",
+        "actor_action_mode": "diff_cbf",
+    },
 ]
 
 TB_VARIANT_RUN_NAMES = {
     "ddpg": "ddpg",
     "ddpg_cbf_reward": "cbfr",
     "guided_ddpg_cbf": "guided",
+    "update_a_raw_q_raw_bc": "updA_rawQ",
+    "update_b_safe_critic_raw_actor": "updB_safeQ",
+    "update_c_safe_critic_diff_actor": "updC_diff",
 }
 
 SAFETY_REWARD_TRIAL = {
@@ -148,6 +181,7 @@ def make_training_env(
     env_config: dict[str, Any],
     lambda_norm: float,
     lambda_event: float,
+    lambda_raw_violation: float,
     event_threshold: float,
     k0: float,
     k1: float,
@@ -166,6 +200,7 @@ def make_training_env(
             seed=env_seed,
             lambda_norm=lambda_norm,
             lambda_event=lambda_event,
+            lambda_raw_violation=lambda_raw_violation,
             event_threshold=event_threshold,
             k0=k0,
             k1=k1,
@@ -593,6 +628,10 @@ def train_variant(
     output_dir: Path,
 ) -> dict[str, float | str | bool]:
     variant = str(variant_cfg["variant"])
+    variant_index = next(
+        (index for index, item in enumerate(VARIANTS) if str(item["variant"]) == variant),
+        0,
+    )
     variant_dir = output_dir / variant
     variant_dir.mkdir(parents=True, exist_ok=True)
     model_path = variant_dir / "model.zip"
@@ -609,12 +648,13 @@ def train_variant(
     train_env = make_training_env(
         namespace,
         env_kind=env_kind,
-        seed=args.seed + 1_000 * (VARIANTS.index(variant_cfg) + 1),
+        seed=args.seed + 1_000 * (variant_index + 1),
         reward_config=reward_config,
         env_config=env_config,
-        lambda_norm=args.lambda_norm,
-        lambda_event=args.lambda_event if env_kind != "baseline" else 0.0,
-        event_threshold=args.event_threshold,
+            lambda_norm=args.lambda_norm,
+            lambda_event=args.lambda_event if env_kind != "baseline" else 0.0,
+            lambda_raw_violation=args.raw_violation_reward_weight if env_kind != "baseline" else 0.0,
+            event_threshold=args.event_threshold,
         k0=args.k0,
         k1=args.k1,
         eps_side=args.eps_side,
@@ -635,7 +675,7 @@ def train_variant(
         task_max_steps=args.task_max_steps,
         eval_freq=args.train_eval_freq,
         episodes=args.train_eval_episodes,
-        seed=args.seed + 10_000 * (VARIANTS.index(variant_cfg) + 1),
+        seed=args.seed + 10_000 * (variant_index + 1),
     )
     learn_callback: BaseCallback = callback
     tb_root = output_dir / "tb"
@@ -658,10 +698,14 @@ def train_variant(
                 "k1": float(args.k1),
                 "lambda_norm": float(args.lambda_norm if env_kind != "baseline" else 0.0),
                 "lambda_event": float(args.lambda_event if env_kind != "baseline" else 0.0),
+                "lambda_raw_violation": float(args.raw_violation_reward_weight if env_kind != "baseline" else 0.0),
                 "event_threshold": float(args.event_threshold),
                 "projected_q": bool(namespace.get("GUIDED_CBF_USE_PROJECTED_Q", False))
                 if variant_cfg.get("model_class_name") == "GuidedCBFDDPG"
                 else False,
+                "projected_q_weight": float(namespace.get("GUIDED_CBF_PROJECTED_Q_WEIGHT", 0.0))
+                if variant_cfg.get("model_class_name") == "GuidedCBFDDPG"
+                else 0.0,
                 "task_distance_m": float(args.task_distance_m),
                 "task_max_steps": int(args.task_max_steps),
             },
@@ -682,10 +726,36 @@ def train_variant(
             model_kwargs.update(
                 {
                     "lambda_bc": float(variant_cfg["lambda_bc"]),
+                    "lambda_bc_final": None
+                    if namespace.get("GUIDED_CBF_LAMBDA_BC_FINAL") is None
+                    else float(namespace["GUIDED_CBF_LAMBDA_BC_FINAL"]),
+                    "lambda_bc_decay_steps": int(namespace.get("GUIDED_CBF_LAMBDA_BC_DECAY_STEPS", 0)),
                     "bc_delta": namespace["GUIDED_CBF_BC_DELTA"],
                     "bc_action_scale": namespace["GUIDED_CBF_ACTION_SCALE"],
                     "bc_weight_max": namespace["GUIDED_CBF_WEIGHT_MAX"],
                     "use_projected_q": namespace["GUIDED_CBF_USE_PROJECTED_Q"],
+                    "projected_q_weight": namespace["GUIDED_CBF_PROJECTED_Q_WEIGHT"],
+                    "critic_action_mode": str(
+                        variant_cfg.get("critic_action_mode", namespace.get("GUIDED_CBF_CRITIC_ACTION_MODE", "raw"))
+                    ),
+                    "actor_action_mode": str(
+                        variant_cfg.get("actor_action_mode", namespace.get("GUIDED_CBF_ACTOR_ACTION_MODE", "raw"))
+                    ),
+                    "cbf_projection_steps": int(namespace.get("GUIDED_CBF_DIFF_PROJECTION_STEPS", 2)),
+                    "cbf_projection_fd_step": float(namespace.get("GUIDED_CBF_DIFF_PROJECTION_FD_STEP", 1e-3)),
+                    "cbf_road_width": float(env_config.get("road_width", namespace["ENV_CONFIG"].get("road_width", 10.2))),
+                    "cbf_sensing_range": float(
+                        env_config.get("sensing_range", namespace["ENV_CONFIG"].get("sensing_range", 90.0))
+                    ),
+                    "cbf_obs_vmax": float(
+                        env_config.get("observation_vmax", namespace["ENV_CONFIG"].get("observation_vmax", 24.0))
+                    ),
+                    "cbf_obs_vymax": float(
+                        env_config.get("observation_vymax", namespace["ENV_CONFIG"].get("observation_vymax", 7.2))
+                    ),
+                    "cbf_eps_side": float(args.eps_side),
+                    "cbf_k0": float(args.k0),
+                    "cbf_k1": float(args.k1),
                 }
             )
         model = model_cls(
@@ -703,7 +773,7 @@ def train_variant(
             policy_kwargs={"net_arch": [256, 128]},
             tensorboard_log=None if args.skip_tensorboard else str(tb_sb3_root),
             verbose=0,
-            seed=args.seed + VARIANTS.index(variant_cfg) + 1,
+            seed=args.seed + variant_index + 1,
             device=args.device,
             **model_kwargs,
         )
@@ -747,7 +817,7 @@ def train_variant(
         model,
         env_kind=env_kind,
         episodes=args.final_eval_episodes,
-        seed=args.seed + 100_000 * (VARIANTS.index(variant_cfg) + 1),
+        seed=args.seed + 100_000 * (variant_index + 1),
         reward_config=reward_config,
         env_config=env_config,
         event_threshold=args.event_threshold,
@@ -772,6 +842,8 @@ def train_variant(
         "lambda_norm": float(args.lambda_norm if env_kind != "baseline" else 0.0),
         "lambda_event": float(args.lambda_event if env_kind != "baseline" else 0.0),
         "lambda_bc": float(variant_cfg["lambda_bc"]),
+        "critic_action_mode": str(variant_cfg.get("critic_action_mode", "raw")),
+        "actor_action_mode": str(variant_cfg.get("actor_action_mode", "raw")),
         "event_threshold": float(args.event_threshold),
         "wy": float(reward_config["wy"]),
         "wf": float(reward_config["wf"]),
@@ -893,7 +965,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eps-side", type=float, default=0.10)
     parser.add_argument("--lambda-norm", type=float, default=0.025)
     parser.add_argument("--lambda-event", type=float, default=0.02)
+    parser.add_argument("--raw-violation-reward-weight", type=float, default=0.0)
     parser.add_argument("--event-threshold", type=float, default=0.03)
+    parser.add_argument("--guided-lambda-bc", type=float, default=None)
+    parser.add_argument("--guided-lambda-bc-final", type=float, default=None)
+    parser.add_argument("--guided-bc-decay-steps", type=int, default=0)
+    parser.add_argument("--guided-projected-q-weight", type=float, default=0.0)
+    parser.add_argument("--disable-guided-projected-q", action="store_true")
     parser.add_argument("--task-distance-m", type=float, default=1000.0)
     parser.add_argument("--task-max-steps", type=int, default=1200)
     parser.add_argument("--legacy-fixed-step-eval", action="store_true")
@@ -904,6 +982,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tb-write-freq", type=int, default=100)
     parser.add_argument("--tb-flush-freq", type=int, default=500)
     parser.add_argument("--force-mtm-congested", action="store_true", default=True)
+    parser.add_argument(
+        "--variants",
+        nargs="+",
+        default=None,
+        help="Optional subset of policy variants to train, e.g. guided_ddpg_cbf.",
+    )
     parser.add_argument("--skip-videos", action="store_true")
     parser.add_argument("--skip-normal-video", action="store_true")
     parser.add_argument("--skip-scenario-videos", action="store_true")
@@ -930,6 +1014,12 @@ def main() -> int:
     namespace["CBF_EPS_SIDE"] = float(args.eps_side)
     namespace["CBF_FILTER_REWARD_LAMBDA"] = float(args.lambda_norm)
     install_minimal_guided_cbf(namespace)
+    namespace["GUIDED_CBF_USE_PROJECTED_Q"] = not bool(args.disable_guided_projected_q)
+    namespace["GUIDED_CBF_PROJECTED_Q_WEIGHT"] = float(np.clip(args.guided_projected_q_weight, 0.0, 1.0))
+    namespace["GUIDED_CBF_LAMBDA_BC_FINAL"] = args.guided_lambda_bc_final
+    namespace["GUIDED_CBF_LAMBDA_BC_DECAY_STEPS"] = int(max(args.guided_bc_decay_steps, 0))
+    if namespace["GUIDED_CBF_USE_PROJECTED_Q"] and namespace["GUIDED_CBF_PROJECTED_Q_WEIGHT"] > 0.0:
+        namespace["install_cbf_projection_reporting"]()
     install_safety_set_reward_wrapper(namespace)
     install_event_penalty_env(namespace)
 
@@ -955,19 +1045,41 @@ def main() -> int:
     output_dir = args.output_dir or (Path(namespace["ARTIFACT_DIR"]) / output_name)
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    selected_variants = VARIANTS
+    if args.variants is not None:
+        valid_variants = {str(item["variant"]) for item in VARIANTS}
+        requested_variants = list(dict.fromkeys(str(item) for item in args.variants))
+        invalid_variants = sorted(set(requested_variants) - valid_variants)
+        if invalid_variants:
+            raise ValueError(f"Unknown variants: {invalid_variants}. Valid variants: {sorted(valid_variants)}")
+        selected_variants = [item for item in VARIANTS if str(item["variant"]) in requested_variants]
+    selected_variants = [dict(item) for item in selected_variants]
+    if args.guided_lambda_bc is not None:
+        for item in selected_variants:
+            if item.get("model_class_name") == "GuidedCBFDDPG":
+                item["lambda_bc"] = float(args.guided_lambda_bc)
+
     run_config = {
         "timesteps": int(args.timesteps),
         "chunk_timesteps": int(args.chunk_timesteps),
         "traffic_model": traffic_model,
         "env_config": env_config,
         "reward_config": reward_config,
-        "variants": VARIANTS,
+        "variants": selected_variants,
         "k0": float(args.k0),
         "k1": float(args.k1),
         "eps_side": float(args.eps_side),
         "lambda_norm": float(args.lambda_norm),
         "lambda_event": float(args.lambda_event),
+        "raw_violation_reward_weight": float(args.raw_violation_reward_weight),
         "event_threshold": float(args.event_threshold),
+        "guided_lambda_bc": None if args.guided_lambda_bc is None else float(args.guided_lambda_bc),
+        "guided_lambda_bc_final": None
+        if args.guided_lambda_bc_final is None
+        else float(args.guided_lambda_bc_final),
+        "guided_bc_decay_steps": int(args.guided_bc_decay_steps),
+        "guided_projected_q": bool(namespace["GUIDED_CBF_USE_PROJECTED_Q"]),
+        "guided_projected_q_weight": float(namespace["GUIDED_CBF_PROJECTED_Q_WEIGHT"]),
         "use_distance_task_eval": bool(not args.legacy_fixed_step_eval),
         "task_distance_m": float(args.task_distance_m),
         "task_max_steps": int(args.task_max_steps),
@@ -984,6 +1096,8 @@ def main() -> int:
         f" traffic={traffic_model}"
         f" timesteps={args.timesteps:,}"
         f" eps={args.eps_side:g}"
+        f" projected_q={namespace['GUIDED_CBF_USE_PROJECTED_Q']}:{namespace['GUIDED_CBF_PROJECTED_Q_WEIGHT']:g}"
+        f" raw_violation={args.raw_violation_reward_weight:g}"
         f" task={args.task_distance_m:g}m/{args.task_max_steps}steps"
         f" progress={reward_config.get('progress_reward_weight', 0.0):g}",
         f" tensorboard={not args.skip_tensorboard}",
@@ -992,7 +1106,7 @@ def main() -> int:
 
     summaries: list[dict[str, float | str | bool]] = []
     model_paths: dict[str, Path] = {}
-    for variant_cfg in VARIANTS:
+    for variant_cfg in selected_variants:
         summary = train_variant(
             namespace,
             args,
@@ -1038,7 +1152,7 @@ def main() -> int:
         display_cols = [column for column in display_cols if column in summary_frame.columns]
         print(summary_frame[display_cols].to_string(index=False), flush=True)
 
-    if not args.skip_videos:
+    if not args.skip_videos and len(model_paths) == len(VARIANTS):
         video_summary_path = export_videos(
             namespace,
             env_config=env_config,
@@ -1047,6 +1161,8 @@ def main() -> int:
             args=args,
         )
         print(f"[safety-potential] videos summary {video_summary_path}", flush=True)
+    elif not args.skip_videos:
+        print("[safety-potential-video] skipped because only a variant subset was trained", flush=True)
     return 0
 
 

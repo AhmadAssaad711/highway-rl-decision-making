@@ -301,6 +301,9 @@ def evaluate_variant(
     eps_side: float,
     event_threshold: float,
     env_config: dict[str, Any] | None = None,
+    use_distance_task: bool = True,
+    task_distance_m: float = 1000.0,
+    task_max_steps: int = 1200,
     collect_steps: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     episode_rows: list[dict[str, float]] = []
@@ -317,7 +320,14 @@ def evaluate_variant(
             use_safety_obs=use_safety_obs,
             env_config=env_config,
         )
-        namespace["configure_paper_evaluation_env"](env, steps=namespace["PAPER_EVAL_STEPS"])
+        if use_distance_task and "make_task_evaluation_wrapper" in namespace:
+            env = namespace["make_task_evaluation_wrapper"](
+                env,
+                task_distance_m=float(task_distance_m),
+                max_steps=int(task_max_steps),
+            )
+        else:
+            namespace["configure_paper_evaluation_env"](env, steps=namespace["PAPER_EVAL_STEPS"])
         obs, _ = env.reset(seed=seed + episode)
         done = False
         step_count = 0
@@ -336,6 +346,8 @@ def evaluate_variant(
         ego_collisions = 0
         ego_collision_steps = 0
         all_collision_events = 0
+        last_task_info: dict[str, Any] = {}
+        kpi_info_rows: list[dict[str, Any]] = []
 
         while not done:
             action, _ = model.predict(obs, deterministic=True)
@@ -366,6 +378,14 @@ def evaluate_variant(
             fallbacks.append(fallback)
             min_h_values.append(min_h)
             min_boundary_h_values.append(min_boundary_h)
+            kpi_info_rows.append(dict(info))
+            last_task_info = {
+                "task_distance_m": float(info.get("task_distance_m", task_distance_m)),
+                "task_distance_traveled_m": float(info.get("task_distance_traveled_m", 0.0)),
+                "task_progress_ratio": float(info.get("task_progress_ratio", 0.0)),
+                "task_completed": bool(info.get("task_completed", False)),
+                "task_timeout": bool(info.get("task_timeout", False)),
+            }
             all_collision_events += int(info.get("collisions", 0))
             ego_collisions += int(info.get("ego_collision_events", 0))
             if bool(info.get("ego_collision", False)):
@@ -387,6 +407,8 @@ def evaluate_variant(
                         "mean_abs_speed_error": abs(speed_error),
                         "lat_y_error_m": lat_y_error,
                         "ego_collision": float(bool(info.get("ego_collision", False))),
+                        "task_distance_traveled_m": float(last_task_info.get("task_distance_traveled_m", 0.0)),
+                        "task_progress_ratio": float(last_task_info.get("task_progress_ratio", 0.0)),
                     }
                 )
             step_count += 1
@@ -396,7 +418,14 @@ def evaluate_variant(
             {
                 "episode": float(episode),
                 "steps": float(step_count),
+                "episode_length_steps": float(step_count),
                 "return": float(np.sum(rewards)),
+                "episode_return": float(np.sum(rewards)),
+                "task_completed": float(last_task_info.get("task_completed", False)),
+                "task_timeout": float(last_task_info.get("task_timeout", False)),
+                "task_distance_m": float(last_task_info.get("task_distance_m", task_distance_m)),
+                "task_distance_traveled_m": float(last_task_info.get("task_distance_traveled_m", 0.0)),
+                "task_progress_ratio": float(last_task_info.get("task_progress_ratio", 0.0)),
                 "mean_speed": float(np.mean(speeds)) if speeds else 0.0,
                 "mean_signed_speed_error": float(np.mean(signed_speed_errors)) if signed_speed_errors else 0.0,
                 "mean_abs_speed_error": float(np.mean(abs_speed_errors)) if abs_speed_errors else 0.0,
@@ -416,6 +445,18 @@ def evaluate_variant(
                 "total_collision_events": float(all_collision_events),
             }
         )
+        summarize_episode_kpis = namespace.get("summarize_episode_kpis")
+        if callable(summarize_episode_kpis):
+            episode_rows[-1].update(
+                summarize_episode_kpis(
+                    kpi_info_rows,
+                    rewards=rewards,
+                    task_completed=bool(last_task_info.get("task_completed", False)),
+                    fallback_steps=step_count,
+                    fallback_distance_m=float(last_task_info.get("task_distance_traveled_m", 0.0)),
+                    fallback_dt_s=namespace["kpi_policy_dt"](env) if "kpi_policy_dt" in namespace else np.nan,
+                )
+            )
         env.close()
     return pd.DataFrame(episode_rows), pd.DataFrame(step_rows)
 
@@ -435,6 +476,8 @@ class SafetyObsEvalCallback(BaseCallback):
         k1: float,
         eps_side: float,
         env_config: dict[str, Any] | None,
+        task_distance_m: float,
+        task_max_steps: int,
         eval_freq: int,
         episodes: int,
         seed: int,
@@ -451,6 +494,8 @@ class SafetyObsEvalCallback(BaseCallback):
         self.k1 = float(k1)
         self.eps_side = float(eps_side)
         self.env_config = env_config
+        self.task_distance_m = float(task_distance_m)
+        self.task_max_steps = int(task_max_steps)
         self.eval_freq = int(eval_freq)
         self.episodes = int(episodes)
         self.seed = int(seed)
@@ -473,6 +518,9 @@ class SafetyObsEvalCallback(BaseCallback):
             eps_side=self.eps_side,
             event_threshold=self.event_threshold,
             env_config=self.env_config,
+            use_distance_task=True,
+            task_distance_m=self.task_distance_m,
+            task_max_steps=self.task_max_steps,
             collect_steps=False,
         )
         row: dict[str, float | str | bool] = {
@@ -555,6 +603,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=711_000)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--n-envs", type=int, default=1)
+    parser.add_argument("--task-distance-m", type=float, default=1000.0)
+    parser.add_argument("--task-max-steps", type=int, default=1200)
     add_env_config_args(parser)
     parser.add_argument("--project-root", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -594,6 +644,8 @@ def main() -> int:
             "timesteps": args.timesteps,
             "final_eval_episodes": args.final_eval_episodes,
             "event_threshold": args.event_threshold,
+            "task_distance_m": args.task_distance_m,
+            "task_max_steps": args.task_max_steps,
             "traffic_model": traffic_model,
             "k0": args.k0,
             "k1": args.k1,
@@ -710,6 +762,9 @@ def main() -> int:
                     eps_side=args.eps_side,
                     event_threshold=args.event_threshold,
                     env_config=env_config,
+                    use_distance_task=True,
+                    task_distance_m=args.task_distance_m,
+                    task_max_steps=args.task_max_steps,
                     collect_steps=False,
                 )
                 row: dict[str, float | str | bool] = {
@@ -758,6 +813,9 @@ def main() -> int:
             eps_side=args.eps_side,
             event_threshold=args.event_threshold,
             env_config=env_config,
+            use_distance_task=True,
+            task_distance_m=args.task_distance_m,
+            task_max_steps=args.task_max_steps,
             collect_steps=True,
         )
         final_metrics.to_csv(final_episodes_path, index=False)
@@ -774,6 +832,8 @@ def main() -> int:
             "eps_side": float(args.eps_side),
             "event_threshold": float(args.event_threshold),
             "traffic_model": traffic_model,
+            "task_distance_m": float(args.task_distance_m),
+            "task_max_steps": int(args.task_max_steps),
             "lambda_norm": lambda_norm,
             "lambda_event": lambda_event,
             "lambda_bc": lambda_bc,

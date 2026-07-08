@@ -227,7 +227,8 @@ def policy_action_phys(
 
 
 def load_model_for_variant(namespace: dict[str, Any], variant: str, checkpoint_path: Path, device: str) -> Any:
-    model_cls = namespace["GuidedCBFDDPG"] if variant == "guided_ddpg_cbf" else DDPG
+    variant_cfg = next((item for item in VARIANTS if str(item["variant"]) == variant), {})
+    model_cls = namespace["GuidedCBFDDPG"] if variant_cfg.get("model_class_name") == "GuidedCBFDDPG" else DDPG
     return model_cls.load(str(checkpoint_path), device=device)
 
 
@@ -587,6 +588,8 @@ def compute_diagnostics(summary: pd.DataFrame) -> pd.DataFrame:
             row["random_cbf_return"] = float(random_cbf.get("return_mean", np.nan))
             row["random_cbf_ego_collisions"] = float(random_cbf.get("ego_collisions_mean", np.nan))
         rows.append(row)
+    if not rows:
+        return pd.DataFrame(columns=["variant", "checkpoint_step"])
     return pd.DataFrame(rows).sort_values(["variant", "checkpoint_step"]).reset_index(drop=True)
 
 
@@ -639,6 +642,7 @@ def write_tensorboard(namespace: dict[str, Any], summary: pd.DataFrame, diagnost
 def plot_summary(summary: pd.DataFrame, diagnostics: pd.DataFrame, output_path: Path) -> None:
     if summary.empty:
         return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     variants = list(dict.fromkeys(summary["variant"].astype(str)))
     fig, axes = plt.subplots(2, 2, figsize=(13.5, 8.0), sharex=False)
     for variant in variants:
@@ -681,7 +685,7 @@ def plot_summary(summary: pd.DataFrame, diagnostics: pd.DataFrame, output_path: 
     plt.close(fig)
 
     if not diagnostics.empty:
-        diag_path = output_path.with_name(output_path.stem + "_deltas" + output_path.suffix)
+        diag_path = output_path.parent / "deltas.png"
         fig, axes = plt.subplots(1, 3, figsize=(13.5, 3.8), sharex=True)
         for variant in variants:
             frame = diagnostics[diagnostics["variant"] == variant].sort_values("checkpoint_step")
