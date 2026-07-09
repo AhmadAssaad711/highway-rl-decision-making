@@ -20,6 +20,7 @@ from cbf_lambda_event_bc_pilot_sweep import (
 from cbf_reward_term_ablation import NOTEBOOK_DEPS, behavior_score, install_safety_set_reward_wrapper, summarize
 from guided_cbf_minimal import install_minimal_guided_cbf
 from train_safety_potential_variants import (
+    INITIAL_VARIANT_NAMES,
     TB_VARIANT_RUN_NAMES,
     VARIANTS,
     evaluate_model,
@@ -150,6 +151,8 @@ def main() -> int:
 
     env_config = dict(run_config["env_config"])
     reward_config = dict(run_config["reward_config"])
+    baseline_reward_config = dict(run_config.get("baseline_reward_config", reward_config))
+    cbf_reward_config = dict(run_config.get("cbf_reward_config", reward_config))
     use_distance_task = bool(run_config.get("use_distance_task_eval", True))
     task_distance_m = float(run_config.get("task_distance_m", 1000.0))
     task_max_steps = int(run_config.get("task_max_steps", 1200))
@@ -169,8 +172,16 @@ def main() -> int:
     )
 
     summaries: list[dict[str, Any]] = []
-    variant_filter = None if args.variants is None else set(args.variants)
-    selected_variants = [cfg for cfg in VARIANTS if variant_filter is None or str(cfg["variant"]) in variant_filter]
+    if args.variants is None:
+        configured_variants = [
+            str(item.get("variant"))
+            for item in run_config.get("variants", [])
+            if isinstance(item, dict) and item.get("variant")
+        ]
+        variant_filter = set(configured_variants or INITIAL_VARIANT_NAMES)
+    else:
+        variant_filter = set(args.variants)
+    selected_variants = [cfg for cfg in VARIANTS if str(cfg["variant"]) in variant_filter]
     if not selected_variants:
         raise ValueError(f"No variants selected from {args.variants!r}")
 
@@ -181,6 +192,7 @@ def main() -> int:
         if not model_path.exists():
             raise FileNotFoundError(model_path)
         model = load_model(namespace, variant_cfg, model_path, args.device)
+        variant_reward_config = baseline_reward_config if str(variant_cfg["env_kind"]) == "baseline" else cbf_reward_config
         print(f"[kpi-final-eval] evaluating {variant} from {model_path}", flush=True)
         episodes = evaluate_model(
             namespace,
@@ -188,7 +200,7 @@ def main() -> int:
             env_kind=str(variant_cfg["env_kind"]),
             episodes=int(args.episodes),
             seed=int(args.seed) + 100_000 * (index + 1) + int(args.episode_start),
-            reward_config=reward_config,
+            reward_config=variant_reward_config,
             env_config=env_config,
             event_threshold=event_threshold,
             k0=k0,

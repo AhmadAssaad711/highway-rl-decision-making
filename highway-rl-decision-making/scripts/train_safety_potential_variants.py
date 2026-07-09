@@ -71,6 +71,8 @@ VARIANTS = [
         "env_kind": "event_cbf",
         "model_class_name": "GuidedCBFDDPG",
         "lambda_bc": 0.03,
+        "critic_action_mode": "raw",
+        "actor_action_mode": "raw",
     },
     {
         "variant": "update_a_raw_q_raw_bc",
@@ -103,6 +105,8 @@ VARIANTS = [
         "actor_action_mode": "diff_cbf",
     },
 ]
+
+INITIAL_VARIANT_NAMES = ("ddpg", "ddpg_cbf_reward", "guided_ddpg_cbf")
 
 TB_VARIANT_RUN_NAMES = {
     "ddpg": "ddpg",
@@ -564,6 +568,96 @@ def latest_checkpoint(variant_dir: Path) -> Path | None:
     return checkpoints[-1] if checkpoints else None
 
 
+def make_baseline_reward_config(
+    namespace: dict[str, Any],
+    *,
+    progress_reward_weight: float,
+    progress_clip: float,
+    eps_side: float,
+) -> dict[str, float]:
+    config = dict(namespace["REWARD_CONFIG"])
+    config.update(
+        {
+            "progress_reward_weight": float(progress_reward_weight),
+            "progress_clip": float(progress_clip),
+            "use_current_potential": 1.0,
+            "use_safety_potential": 0.0,
+            "w_safe": 0.0,
+            "safety_potential_eps_side": float(eps_side),
+        }
+    )
+    return config
+
+
+def make_cbf_reward_config(
+    namespace: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, float]:
+    config = make_reward_config(namespace, SAFETY_REWARD_TRIAL)
+    config.update(
+        {
+            "progress_reward_weight": float(args.progress_reward_weight),
+            "progress_clip": float(args.progress_clip),
+            "wf": 0.0,
+            "use_current_potential": 0.0,
+            "use_safety_potential": 1.0,
+            "safety_potential_eps_side": float(args.eps_side),
+        }
+    )
+    return config
+
+
+def reward_config_for_variant(
+    variant_cfg: dict[str, Any],
+    *,
+    baseline_reward_config: dict[str, float],
+    cbf_reward_config: dict[str, float],
+) -> dict[str, float]:
+    if str(variant_cfg.get("env_kind", "")) == "baseline":
+        return baseline_reward_config
+    return cbf_reward_config
+
+
+def apply_guided_runtime_config(
+    model: Any,
+    namespace: dict[str, Any],
+    variant_cfg: dict[str, Any],
+    args: argparse.Namespace,
+    env_config: dict[str, Any],
+) -> None:
+    if variant_cfg.get("model_class_name") != "GuidedCBFDDPG":
+        return
+    model.lambda_bc = float(variant_cfg["lambda_bc"])
+    model.lambda_bc_initial = float(variant_cfg["lambda_bc"])
+    model.lambda_bc_final = (
+        None
+        if namespace.get("GUIDED_CBF_LAMBDA_BC_FINAL") is None
+        else float(namespace["GUIDED_CBF_LAMBDA_BC_FINAL"])
+    )
+    model.lambda_bc_decay_steps = int(namespace.get("GUIDED_CBF_LAMBDA_BC_DECAY_STEPS", 0))
+    model.use_projected_q = bool(namespace["GUIDED_CBF_USE_PROJECTED_Q"])
+    model.projected_q_weight = float(namespace["GUIDED_CBF_PROJECTED_Q_WEIGHT"])
+    model.critic_action_mode = str(
+        variant_cfg.get("critic_action_mode", namespace.get("GUIDED_CBF_CRITIC_ACTION_MODE", "raw"))
+    ).strip().lower()
+    model.actor_action_mode = str(
+        variant_cfg.get("actor_action_mode", namespace.get("GUIDED_CBF_ACTOR_ACTION_MODE", "raw"))
+    ).strip().lower()
+    if model.critic_action_mode not in {"raw", "safe"}:
+        raise ValueError(f"critic_action_mode must be 'raw' or 'safe', got {model.critic_action_mode!r}")
+    if model.actor_action_mode not in {"raw", "diff_cbf"}:
+        raise ValueError(f"actor_action_mode must be 'raw' or 'diff_cbf', got {model.actor_action_mode!r}")
+    model.cbf_projection_steps = int(namespace.get("GUIDED_CBF_DIFF_PROJECTION_STEPS", 2))
+    model.cbf_projection_fd_step = float(namespace.get("GUIDED_CBF_DIFF_PROJECTION_FD_STEP", 1e-3))
+    model.cbf_road_width = float(env_config.get("road_width", namespace["ENV_CONFIG"].get("road_width", 10.2)))
+    model.cbf_sensing_range = float(env_config.get("sensing_range", namespace["ENV_CONFIG"].get("sensing_range", 90.0)))
+    model.cbf_obs_vmax = float(env_config.get("observation_vmax", namespace["ENV_CONFIG"].get("observation_vmax", 24.0)))
+    model.cbf_obs_vymax = float(env_config.get("observation_vymax", namespace["ENV_CONFIG"].get("observation_vymax", 7.2)))
+    model.cbf_eps_side = float(args.eps_side)
+    model.cbf_k0 = float(args.k0)
+    model.cbf_k1 = float(args.k1)
+
+
 def _tb_scalar(value: Any) -> float:
     if value is None:
         return np.nan
@@ -623,7 +717,8 @@ def train_variant(
     args: argparse.Namespace,
     *,
     variant_cfg: dict[str, Any],
-    reward_config: dict[str, float],
+    baseline_reward_config: dict[str, float],
+    cbf_reward_config: dict[str, float],
     env_config: dict[str, Any],
     output_dir: Path,
 ) -> dict[str, float | str | bool]:
@@ -645,16 +740,21 @@ def train_variant(
         return pd.read_csv(final_summary_path).iloc[0].to_dict()
 
     env_kind = str(variant_cfg["env_kind"])
+    reward_config = reward_config_for_variant(
+        variant_cfg,
+        baseline_reward_config=baseline_reward_config,
+        cbf_reward_config=cbf_reward_config,
+    )
     train_env = make_training_env(
         namespace,
         env_kind=env_kind,
         seed=args.seed + 1_000 * (variant_index + 1),
         reward_config=reward_config,
         env_config=env_config,
-            lambda_norm=args.lambda_norm,
-            lambda_event=args.lambda_event if env_kind != "baseline" else 0.0,
-            lambda_raw_violation=args.raw_violation_reward_weight if env_kind != "baseline" else 0.0,
-            event_threshold=args.event_threshold,
+        lambda_norm=args.lambda_norm,
+        lambda_event=args.lambda_event if env_kind != "baseline" else 0.0,
+        lambda_raw_violation=args.raw_violation_reward_weight if env_kind != "baseline" else 0.0,
+        event_threshold=args.event_threshold,
         k0=args.k0,
         k1=args.k1,
         eps_side=args.eps_side,
@@ -679,9 +779,10 @@ def train_variant(
     )
     learn_callback: BaseCallback = callback
     tb_root = output_dir / "tb"
-    tb_sb3_root = tb_root / "sb3"
     tb_custom_root = tb_root / "custom"
     tb_run_name = TB_VARIANT_RUN_NAMES.get(variant, variant[:12])
+    if not args.skip_tensorboard:
+        tb_custom_root.mkdir(parents=True, exist_ok=True)
     if not args.skip_tensorboard and "TensorBoardMetricsBridgeCallback" in namespace:
         tb_callback = namespace["TensorBoardMetricsBridgeCallback"](
             variant=variant,
@@ -717,8 +818,8 @@ def train_variant(
     if checkpoint is not None and not args.no_resume:
         print(f"[safety-potential] loading checkpoint for {variant}: {checkpoint}", flush=True)
         model = model_cls.load(str(checkpoint), env=train_env, device=args.device)
-        if not args.skip_tensorboard:
-            model.tensorboard_log = str(tb_sb3_root)
+        apply_guided_runtime_config(model, namespace, variant_cfg, args, env_config)
+        model.tensorboard_log = None
     else:
         action_noise = namespace["make_ou_action_noise"](n_actions, n_envs=args.n_envs)
         model_kwargs: dict[str, Any] = {}
@@ -771,7 +872,7 @@ def train_variant(
             gradient_steps=1,
             action_noise=action_noise,
             policy_kwargs={"net_arch": [256, 128]},
-            tensorboard_log=None if args.skip_tensorboard else str(tb_sb3_root),
+            tensorboard_log=None,
             verbose=0,
             seed=args.seed + variant_index + 1,
             device=args.device,
@@ -986,7 +1087,10 @@ def parse_args() -> argparse.Namespace:
         "--variants",
         nargs="+",
         default=None,
-        help="Optional subset of policy variants to train, e.g. guided_ddpg_cbf.",
+        help=(
+            "Optional subset of policy variants to train. "
+            f"Default: {' '.join(INITIAL_VARIANT_NAMES)}."
+        ),
     )
     parser.add_argument("--skip-videos", action="store_true")
     parser.add_argument("--skip-normal-video", action="store_true")
@@ -1014,8 +1118,10 @@ def main() -> int:
     namespace["CBF_EPS_SIDE"] = float(args.eps_side)
     namespace["CBF_FILTER_REWARD_LAMBDA"] = float(args.lambda_norm)
     install_minimal_guided_cbf(namespace)
-    namespace["GUIDED_CBF_USE_PROJECTED_Q"] = not bool(args.disable_guided_projected_q)
     namespace["GUIDED_CBF_PROJECTED_Q_WEIGHT"] = float(np.clip(args.guided_projected_q_weight, 0.0, 1.0))
+    namespace["GUIDED_CBF_USE_PROJECTED_Q"] = (
+        not bool(args.disable_guided_projected_q) and namespace["GUIDED_CBF_PROJECTED_Q_WEIGHT"] > 0.0
+    )
     namespace["GUIDED_CBF_LAMBDA_BC_FINAL"] = args.guided_lambda_bc_final
     namespace["GUIDED_CBF_LAMBDA_BC_DECAY_STEPS"] = int(max(args.guided_bc_decay_steps, 0))
     if namespace["GUIDED_CBF_USE_PROJECTED_Q"] and namespace["GUIDED_CBF_PROJECTED_Q_WEIGHT"] > 0.0:
@@ -1028,24 +1134,20 @@ def main() -> int:
         deep_update(env_config, MTM_CONGESTED_UNCERTAIN_UPDATES)
     traffic_model = active_traffic_model(env_config)
 
-    reward_config = make_reward_config(namespace, SAFETY_REWARD_TRIAL)
-    reward_config.update(
-        {
-            "progress_reward_weight": float(args.progress_reward_weight),
-            "progress_clip": float(args.progress_clip),
-            "wf": 0.0,
-            "use_current_potential": 0.0,
-            "use_safety_potential": 1.0,
-            "safety_potential_eps_side": float(args.eps_side),
-        }
+    baseline_reward_config = make_baseline_reward_config(
+        namespace,
+        progress_reward_weight=float(args.progress_reward_weight),
+        progress_clip=float(args.progress_clip),
+        eps_side=float(args.eps_side),
     )
+    cbf_reward_config = make_cbf_reward_config(namespace, args)
     eps_tag = str(args.eps_side).replace(".", "p")
     progress_tag = str(args.progress_reward_weight).replace(".", "p").replace("-", "m")
     output_name = f"sp3_{traffic_model}_e{eps_tag}_p{progress_tag}"
     output_dir = args.output_dir or (Path(namespace["ARTIFACT_DIR"]) / output_name)
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    selected_variants = VARIANTS
+    selected_variants = [item for item in VARIANTS if str(item["variant"]) in INITIAL_VARIANT_NAMES]
     if args.variants is not None:
         valid_variants = {str(item["variant"]) for item in VARIANTS}
         requested_variants = list(dict.fromkeys(str(item) for item in args.variants))
@@ -1064,7 +1166,9 @@ def main() -> int:
         "chunk_timesteps": int(args.chunk_timesteps),
         "traffic_model": traffic_model,
         "env_config": env_config,
-        "reward_config": reward_config,
+        "reward_config": cbf_reward_config,
+        "baseline_reward_config": baseline_reward_config,
+        "cbf_reward_config": cbf_reward_config,
         "variants": selected_variants,
         "k0": float(args.k0),
         "k1": float(args.k1),
@@ -1099,7 +1203,7 @@ def main() -> int:
         f" projected_q={namespace['GUIDED_CBF_USE_PROJECTED_Q']}:{namespace['GUIDED_CBF_PROJECTED_Q_WEIGHT']:g}"
         f" raw_violation={args.raw_violation_reward_weight:g}"
         f" task={args.task_distance_m:g}m/{args.task_max_steps}steps"
-        f" progress={reward_config.get('progress_reward_weight', 0.0):g}",
+        f" progress={cbf_reward_config.get('progress_reward_weight', 0.0):g}",
         f" tensorboard={not args.skip_tensorboard}",
         flush=True,
     )
@@ -1111,7 +1215,8 @@ def main() -> int:
             namespace,
             args,
             variant_cfg=variant_cfg,
-            reward_config=reward_config,
+            baseline_reward_config=baseline_reward_config,
+            cbf_reward_config=cbf_reward_config,
             env_config=env_config,
             output_dir=output_dir,
         )
@@ -1152,7 +1257,8 @@ def main() -> int:
         display_cols = [column for column in display_cols if column in summary_frame.columns]
         print(summary_frame[display_cols].to_string(index=False), flush=True)
 
-    if not args.skip_videos and len(model_paths) == len(VARIANTS):
+    required_video_models = {"ddpg", "ddpg_cbf_reward", "guided_ddpg_cbf"}
+    if not args.skip_videos and required_video_models.issubset(model_paths):
         video_summary_path = export_videos(
             namespace,
             env_config=env_config,

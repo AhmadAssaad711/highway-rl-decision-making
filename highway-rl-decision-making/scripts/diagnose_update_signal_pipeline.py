@@ -32,6 +32,7 @@ from evaluate_filter_policy_contribution import (
     make_cbf_eval_env,
     model_action_is_normalized,
     model_action_to_physical,
+    physical_bounds,
     physical_to_normalized,
 )
 from guided_cbf_minimal import install_minimal_guided_cbf
@@ -119,6 +120,7 @@ def evaluate_variant(
     episode_rows: list[dict[str, Any]] = []
     low_model = np.asarray(model.action_space.low, dtype=np.float32).reshape(-1)[:2]
     high_model = np.asarray(model.action_space.high, dtype=np.float32).reshape(-1)[:2]
+    low_phys, high_phys = physical_bounds(env_config)
     zero_model_action = np.clip(np.zeros(2, dtype=np.float32), low_model, high_model)
     model.policy.set_training_mode(False)
 
@@ -167,6 +169,12 @@ def evaluate_variant(
                 dtype=np.float32,
             )
             safe_model = model_action_from_physical(namespace, model, env, safe_phys)
+            safe_perturb_phys = np.clip(
+                safe_phys + rng.normal(loc=0.0, scale=np.asarray([0.15, 0.10], dtype=np.float32)),
+                low_phys,
+                high_phys,
+            ).astype(np.float32)
+            safe_perturb_model = model_action_from_physical(namespace, model, env, safe_perturb_phys)
             random_model = rng.uniform(low=low_model, high=high_model).astype(np.float32)
 
             delta = safe_phys - raw_logged
@@ -179,6 +187,7 @@ def evaluate_variant(
 
             q_raw = critic_q(model, obs_before, action_model)
             q_safe = critic_q(model, obs_before, safe_model)
+            q_safe_perturb = critic_q(model, obs_before, safe_perturb_model)
             q_random = critic_q(model, obs_before, random_model)
             q_zero = critic_q(model, obs_before, zero_model_action)
 
@@ -208,6 +217,19 @@ def evaluate_variant(
                     "qp_success": float(qp_success),
                     "qp_failure": float(not qp_success),
                     "fallback_used": float(fallback_used),
+                    "soft_qp_success": float(bool(info.get("cbf_soft_qp_success", False))),
+                    "soft_qp_used": float(bool(info.get("cbf_soft_qp_used", False))),
+                    "soft_qp_slack_l2": _as_float(info.get("cbf_soft_qp_slack_l2"), default=np.nan),
+                    "soft_qp_slack_max": _as_float(info.get("cbf_soft_qp_slack_max"), default=np.nan),
+                    "fallback_source": str(info.get("cbf_fallback_source", "none")),
+                    "fallback_max_constraint_violation": _as_float(
+                        info.get("cbf_fallback_max_constraint_violation"),
+                        default=np.nan,
+                    ),
+                    "fallback_positive_violation_l2": _as_float(
+                        info.get("cbf_fallback_positive_violation_l2"),
+                        default=np.nan,
+                    ),
                     "h_min": _as_float(info.get("cbf_min_h", info.get("kpi_h_min")), default=np.nan),
                     "boundary_h_min": _as_float(
                         info.get("cbf_min_boundary_h", info.get("kpi_boundary_h_min")),
@@ -218,9 +240,12 @@ def evaluate_variant(
                     "projection_bucket": projection_bucket,
                     "q_raw": q_raw,
                     "q_safe": q_safe,
+                    "q_safe_perturb": q_safe_perturb,
                     "q_random": q_random,
                     "q_zero": q_zero,
                     "q_safe_minus_raw": q_safe - q_raw,
+                    "q_safe_perturb_minus_safe": q_safe_perturb - q_safe,
+                    "q_safe_minus_zero": q_safe - q_zero,
                     "ego_collision_events": float(info.get("ego_collision_events", info.get("kpi_ego_collision_events", 0))),
                     "total_collision_events": float(info.get("collisions", info.get("total_collision_events", 0))),
                 }
@@ -263,6 +288,26 @@ def summarize_steps(steps: pd.DataFrame, episodes: pd.DataFrame) -> pd.DataFrame
     for variant, group in steps.groupby("variant", sort=False):
         ep_group = episodes[episodes["variant"] == variant]
         bucket_counts = group["projection_bucket"].value_counts(normalize=True)
+        qp_success_mask = (pd.to_numeric(group["qp_success"], errors="coerce") > 0.5) & (
+            pd.to_numeric(group["fallback_used"], errors="coerce") < 0.5
+        )
+        qp_fail_mask = ~qp_success_mask
+
+        def masked_mean(column: str, mask: pd.Series, default: float = np.nan) -> float:
+            if column not in group:
+                return float(default)
+            return _finite_mean(group.loc[mask, column], default=default)
+
+        def masked_quantile(column: str, mask: pd.Series, q: float, default: float = np.nan) -> float:
+            if column not in group:
+                return float(default)
+            return _finite_quantile(group.loc[mask, column], q=q, default=default)
+
+        def masked_rate(column: str, mask: pd.Series, default: float = np.nan) -> float:
+            if column not in group:
+                return float(default)
+            return _finite_mean(group.loc[mask, column], default=default)
+
         row = {
             "variant": variant,
             "steps": float(len(group)),
@@ -280,6 +325,12 @@ def summarize_steps(steps: pd.DataFrame, episodes: pd.DataFrame) -> pd.DataFrame
             "max_correction_norm": float(pd.to_numeric(group["correction_norm"], errors="coerce").max()),
             "qp_failure_rate": _finite_mean(group["qp_failure"], default=0.0),
             "fallback_rate": _finite_mean(group["fallback_used"], default=0.0),
+            "soft_qp_used_rate": _finite_mean(group["soft_qp_used"], default=0.0),
+            "soft_qp_success_rate": _finite_mean(group["soft_qp_success"], default=0.0),
+            "soft_qp_slack_l2_mean": masked_mean("soft_qp_slack_l2", qp_fail_mask),
+            "soft_qp_slack_max_mean": masked_mean("soft_qp_slack_max", qp_fail_mask),
+            "fallback_max_constraint_violation_mean": masked_mean("fallback_max_constraint_violation", qp_fail_mask),
+            "fallback_positive_violation_l2_mean": masked_mean("fallback_positive_violation_l2", qp_fail_mask),
             "raw_feasible_rate": _finite_mean(group["raw_feasible"], default=0.0),
             "raw_violation_rate": _finite_mean((group["raw_constraint_violation"] > 1e-5).astype(float), default=0.0),
             "safe_infeasible_rate": _finite_mean(group["safe_infeasible"], default=0.0),
@@ -297,11 +348,64 @@ def summarize_steps(steps: pd.DataFrame, episodes: pd.DataFrame) -> pd.DataFrame
             "projected_bucket_rate": float(bucket_counts.get("projected", 0.0)),
             "q_raw_mean": _finite_mean(group["q_raw"]),
             "q_safe_mean": _finite_mean(group["q_safe"]),
+            "q_safe_perturb_mean": _finite_mean(group["q_safe_perturb"]),
             "q_random_mean": _finite_mean(group["q_random"]),
             "q_zero_mean": _finite_mean(group["q_zero"]),
             "q_safe_minus_raw_mean": _finite_mean(group["q_safe_minus_raw"]),
+            "q_raw_minus_safe_mean": _finite_mean(-group["q_safe_minus_raw"]),
+            "q_safe_perturb_minus_safe_mean": _finite_mean(group["q_safe_perturb_minus_safe"]),
+            "q_safe_minus_zero_mean": _finite_mean(group["q_safe_minus_zero"]),
             "q_safe_gt_raw_rate": _finite_mean((group["q_safe_minus_raw"] > 0.0).astype(float), default=0.0),
+            "qp_success_step_rate": float(qp_success_mask.mean()) if len(group) else np.nan,
+            "qp_success_step_reward_mean": masked_mean("reward", qp_success_mask),
+            "qp_fail_step_reward_mean": masked_mean("reward", qp_fail_mask),
+            "correction_norm_qp_success_mean": masked_mean("correction_norm", qp_success_mask, default=0.0),
+            "correction_norm_qp_fail_mean": masked_mean("correction_norm", qp_fail_mask, default=0.0),
+            "correction_norm_qp_success_p95": masked_quantile("correction_norm", qp_success_mask, 0.95, default=0.0),
+            "correction_norm_qp_fail_p95": masked_quantile("correction_norm", qp_fail_mask, 0.95, default=0.0),
+            "safe_infeasible_qp_success_rate": masked_rate("safe_infeasible", qp_success_mask),
+            "safe_infeasible_qp_fail_rate": masked_rate("safe_infeasible", qp_fail_mask),
+            "safe_constraint_violation_qp_success_mean": masked_mean("safe_constraint_violation", qp_success_mask),
+            "safe_constraint_violation_qp_success_p95": masked_quantile(
+                "safe_constraint_violation",
+                qp_success_mask,
+                0.95,
+            ),
+            "safe_constraint_violation_qp_fail_mean": masked_mean("safe_constraint_violation", qp_fail_mask),
+            "safe_constraint_violation_qp_fail_p95": masked_quantile(
+                "safe_constraint_violation",
+                qp_fail_mask,
+                0.95,
+            ),
+            "q_raw_qp_success_mean": masked_mean("q_raw", qp_success_mask),
+            "q_safe_qp_success_mean": masked_mean("q_safe", qp_success_mask),
+            "q_safe_perturb_qp_success_mean": masked_mean("q_safe_perturb", qp_success_mask),
+            "q_zero_qp_success_mean": masked_mean("q_zero", qp_success_mask),
+            "q_safe_minus_raw_qp_success_mean": masked_mean("q_safe_minus_raw", qp_success_mask),
+            "q_raw_minus_safe_qp_success_mean": masked_mean("q_safe_minus_raw", qp_success_mask) * -1.0,
+            "q_safe_minus_zero_qp_success_mean": masked_mean("q_safe_minus_zero", qp_success_mask),
+            "q_safe_gt_raw_qp_success_rate": _finite_mean(
+                (group.loc[qp_success_mask, "q_safe_minus_raw"] > 0.0).astype(float),
+                default=np.nan,
+            ),
+            "q_safe_gt_zero_qp_success_rate": _finite_mean(
+                (group.loc[qp_success_mask, "q_safe_minus_zero"] > 0.0).astype(float),
+                default=np.nan,
+            ),
         }
+        source_counts = group.loc[qp_fail_mask, "fallback_source"].value_counts(normalize=True)
+        for source_name in [
+            "soft_qp",
+            "linprog_minimax",
+            "linprog_after_soft_qp_failure",
+            "continuous_refinement",
+            "continuous_after_soft_qp_failure",
+            "grid_refinement",
+            "grid_after_soft_qp_failure",
+            "legacy_grid",
+            "emergency_brake",
+        ]:
+            row[f"fallback_source_{source_name}_rate"] = float(source_counts.get(source_name, 0.0))
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -382,11 +486,61 @@ def plot_projection_buckets(steps: pd.DataFrame, output_path: Path) -> None:
     plt.close(fig)
 
 
-def write_plots(steps: pd.DataFrame, output_dir: Path) -> None:
+def plot_success_failure_split(summary: pd.DataFrame, output_path: Path) -> None:
+    variants = list(summary["variant"].astype(str))
+    x = np.arange(len(variants))
+    width = 0.36
+    fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.6))
+    axes[0].bar(x - width / 2, summary["correction_norm_qp_success_mean"], width, label="QP success")
+    axes[0].bar(x + width / 2, summary["correction_norm_qp_fail_mean"], width, label="QP fail/fallback")
+    axes[0].set_title("Mean Correction Norm")
+    axes[0].set_ylabel("|u_safe - u_raw|")
+    axes[1].bar(x - width / 2, summary["safe_infeasible_qp_success_rate"], width, label="QP success")
+    axes[1].bar(x + width / 2, summary["safe_infeasible_qp_fail_rate"], width, label="QP fail/fallback")
+    axes[1].set_title("Safe Action Infeasible Rate")
+    axes[1].set_ylabel("Fraction of steps")
+    for axis in axes:
+        axis.set_xticks(x, variants, rotation=15, ha="right")
+        axis.grid(True, axis="y", alpha=0.22)
+        axis.legend(fontsize=8)
+    fig.suptitle("Normal QP Solves vs Fallback Steps", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_qp_success_q_values(summary: pd.DataFrame, output_path: Path) -> None:
+    variants = list(summary["variant"].astype(str))
+    columns = [
+        ("q_raw_qp_success_mean", "raw"),
+        ("q_safe_qp_success_mean", "safe"),
+        ("q_safe_perturb_qp_success_mean", "safe + small perturb"),
+        ("q_zero_qp_success_mean", "zero"),
+    ]
+    x = np.arange(len(variants))
+    width = 0.18
+    fig, axis = plt.subplots(figsize=(12.0, 4.8))
+    for index, (column, label) in enumerate(columns):
+        offsets = (index - (len(columns) - 1) / 2.0) * width
+        axis.bar(x + offsets, summary[column], width, label=label)
+    axis.set_xticks(x, variants, rotation=15, ha="right")
+    axis.set_ylabel("Mean Q on QP-success steps")
+    axis.set_title("Critic Values on In-Distribution Successful Safe Actions")
+    axis.grid(True, axis="y", alpha=0.22)
+    axis.legend(fontsize=8, ncol=2)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def write_plots(steps: pd.DataFrame, summary: pd.DataFrame, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
     plot_qp_fail_over_time(steps, output_dir / "01_qp_failure_over_time.png")
     plot_correction_distribution(steps, output_dir / "02_correction_norm_distribution.png")
     plot_q_raw_vs_safe(steps, output_dir / "03_q_raw_vs_q_safe.png")
     plot_projection_buckets(steps, output_dir / "04_projection_buckets.png")
+    plot_success_failure_split(summary, output_dir / "05_success_vs_fallback.png")
+    plot_qp_success_q_values(summary, output_dir / "06_qp_success_q_values.png")
 
 
 def parse_args() -> argparse.Namespace:
@@ -519,7 +673,7 @@ def main() -> int:
     steps_all.to_csv(steps_path, index=False)
     episodes_all.to_csv(episodes_path, index=False)
     summary.to_csv(summary_path, index=False)
-    write_plots(steps_all, output_dir)
+    write_plots(steps_all, summary, output_dir)
     config_path.write_text(
         json.dumps(
             {

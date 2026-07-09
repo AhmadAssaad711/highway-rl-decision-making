@@ -175,6 +175,420 @@ def _projection_from_active_rows(rows: np.ndarray, action_dim: int) -> np.ndarra
     return projection.astype(np.float32)
 
 
+def _score_constraint_violation(rows: np.ndarray, bounds: np.ndarray, action: np.ndarray) -> dict[str, float]:
+    rows = np.asarray(rows, dtype=float).reshape(-1, 2)
+    bounds = np.asarray(bounds, dtype=float).reshape(-1)
+    action = np.asarray(action, dtype=float).reshape(-1)[:2]
+    if rows.size == 0:
+        return {
+            "max_constraint_violation": 0.0,
+            "positive_violation_l2": 0.0,
+            "positive_violation_sum": 0.0,
+        }
+    positive = np.maximum(rows @ action - bounds, 0.0)
+    return {
+        "max_constraint_violation": float(np.max(positive)) if positive.size else 0.0,
+        "positive_violation_l2": float(np.sqrt(np.sum(positive**2))) if positive.size else 0.0,
+        "positive_violation_sum": float(np.sum(positive)) if positive.size else 0.0,
+    }
+
+
+def _grid_least_violating_bounded_action(
+    a_rl: np.ndarray,
+    constraint_rows: list[np.ndarray],
+    constraint_bounds: list[float],
+    ax_bounds: tuple[float, float],
+    ay_bounds: tuple[float, float],
+) -> np.ndarray:
+    lb = np.asarray([float(ax_bounds[0]), float(ay_bounds[0])], dtype=float)
+    ub = np.asarray([float(ax_bounds[1]), float(ay_bounds[1])], dtype=float)
+    target = np.clip(np.asarray(a_rl, dtype=float).reshape(-1)[:2], lb, ub)
+    rows = np.asarray(constraint_rows, dtype=float).reshape(-1, 2)
+    bounds = np.asarray(constraint_bounds, dtype=float).reshape(-1)
+    ax_grid = np.unique(np.r_[np.linspace(lb[0], ub[0], 49), target[0], lb[0], ub[0]])
+    ay_grid = np.unique(np.r_[np.linspace(lb[1], ub[1], 49), target[1], lb[1], ub[1]])
+    best_action = target.copy()
+    best_score: tuple[float, float, float] | None = None
+    for ax in ax_grid:
+        for ay in ay_grid:
+            candidate = np.asarray([ax, ay], dtype=float)
+            scores = _score_constraint_violation(rows, bounds, candidate)
+            score = (
+                scores["max_constraint_violation"],
+                scores["positive_violation_l2"],
+                float(np.sum((candidate - target) ** 2)),
+            )
+            if best_score is None or score < best_score:
+                best_score = score
+                best_action = candidate
+    return np.clip(best_action, lb, ub).astype(np.float32)
+
+
+def _continuous_least_violating_bounded_action(
+    namespace: dict[str, Any],
+    target: np.ndarray,
+    rows: np.ndarray,
+    bounds: np.ndarray,
+    lb_action: np.ndarray,
+    ub_action: np.ndarray,
+    grid_action: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    target = np.clip(np.asarray(target, dtype=float).reshape(-1)[:2], lb_action, ub_action)
+    rows = np.asarray(rows, dtype=float).reshape(-1, 2)
+    bounds = np.asarray(bounds, dtype=float).reshape(-1)
+    action_weight = float(namespace.get("CBF_SOFT_QP_ACTION_WEIGHT", 1.0))
+    violation_weight = float(namespace.get("CBF_CONTINUOUS_FALLBACK_VIOLATION_WEIGHT", 10_000.0))
+    best_action = np.clip(np.asarray(grid_action, dtype=float).reshape(-1)[:2], lb_action, ub_action)
+    best_scores = _score_constraint_violation(rows, bounds, best_action)
+    best_score: tuple[float, float, float] = (
+        best_scores["max_constraint_violation"],
+        best_scores["positive_violation_l2"],
+        float(np.sum((best_action - target) ** 2)),
+    )
+    error = ""
+
+    def objective(action: np.ndarray) -> float:
+        action = np.asarray(action, dtype=float).reshape(-1)[:2]
+        positive = np.maximum(rows @ action - bounds, 0.0)
+        return float(violation_weight * np.sum(positive**2) + action_weight * np.sum((action - target) ** 2))
+
+    starts = [
+        target,
+        best_action,
+        np.clip(np.zeros(2, dtype=float), lb_action, ub_action),
+        np.asarray([lb_action[0], lb_action[1]], dtype=float),
+        np.asarray([lb_action[0], ub_action[1]], dtype=float),
+        np.asarray([ub_action[0], lb_action[1]], dtype=float),
+        np.asarray([ub_action[0], ub_action[1]], dtype=float),
+    ]
+    try:
+        from scipy.optimize import minimize
+
+        for start in starts:
+            result = minimize(
+                objective,
+                np.clip(np.asarray(start, dtype=float), lb_action, ub_action),
+                method="L-BFGS-B",
+                bounds=[(float(lb_action[0]), float(ub_action[0])), (float(lb_action[1]), float(ub_action[1]))],
+                options={"maxiter": int(namespace.get("CBF_CONTINUOUS_FALLBACK_MAXITER", 80)), "ftol": 1e-10},
+            )
+            if not bool(result.success) and not np.all(np.isfinite(result.x)):
+                continue
+            candidate = np.clip(np.asarray(result.x, dtype=float).reshape(-1)[:2], lb_action, ub_action)
+            scores = _score_constraint_violation(rows, bounds, candidate)
+            score = (
+                scores["max_constraint_violation"],
+                scores["positive_violation_l2"],
+                float(np.sum((candidate - target) ** 2)),
+            )
+            if score < best_score:
+                best_score = score
+                best_action = candidate
+                best_scores = scores
+    except Exception as exc:
+        error = repr(exc)
+
+    info = {
+        "continuous_success": error == "",
+        "continuous_error": error,
+        "continuous_objective": objective(best_action),
+        **best_scores,
+    }
+    return best_action.astype(np.float32), info
+
+
+def _linprog_minimax_bounded_action(
+    namespace: dict[str, Any],
+    target: np.ndarray,
+    rows: np.ndarray,
+    bounds: np.ndarray,
+    lb_action: np.ndarray,
+    ub_action: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    target = np.clip(np.asarray(target, dtype=float).reshape(-1)[:2], lb_action, ub_action)
+    rows = np.asarray(rows, dtype=float).reshape(-1, 2)
+    bounds = np.asarray(bounds, dtype=float).reshape(-1)
+    action = target.copy()
+    error = ""
+    success = False
+    try:
+        from scipy.optimize import linprog
+
+        m_constraints = int(rows.shape[0])
+        a_ub = np.zeros((m_constraints + 1, 3), dtype=float)
+        b_ub = np.zeros(m_constraints + 1, dtype=float)
+        a_ub[:m_constraints, :2] = rows
+        a_ub[:m_constraints, 2] = -1.0
+        b_ub[:m_constraints] = bounds
+        a_ub[m_constraints, 2] = -1.0
+        b_ub[m_constraints] = 0.0
+        t_upper = float(namespace.get("CBF_MINIMAX_FALLBACK_T_UPPER", 10_000.0))
+        result = linprog(
+            c=np.asarray([0.0, 0.0, 1.0], dtype=float),
+            A_ub=a_ub,
+            b_ub=b_ub,
+            bounds=[
+                (float(lb_action[0]), float(ub_action[0])),
+                (float(lb_action[1]), float(ub_action[1])),
+                (0.0, t_upper),
+            ],
+            method="highs",
+        )
+        success = bool(result.success and np.all(np.isfinite(result.x)))
+        if success:
+            action = np.clip(np.asarray(result.x[:2], dtype=float), lb_action, ub_action)
+    except Exception as exc:
+        error = repr(exc)
+
+    scores = _score_constraint_violation(rows, bounds, action)
+    info = {
+        "linprog_success": success,
+        "linprog_error": error,
+        **scores,
+    }
+    return action.astype(np.float32), info
+
+
+def _soft_least_violating_bounded_action(
+    namespace: dict[str, Any],
+    a_rl: np.ndarray,
+    constraint_rows: list[np.ndarray],
+    constraint_bounds: list[float],
+    ax_bounds: tuple[float, float],
+    ay_bounds: tuple[float, float],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    lb_action = np.asarray([float(ax_bounds[0]), float(ay_bounds[0])], dtype=float)
+    ub_action = np.asarray([float(ax_bounds[1]), float(ay_bounds[1])], dtype=float)
+    target = np.clip(np.asarray(a_rl, dtype=float).reshape(-1)[:2], lb_action, ub_action)
+    rows = np.asarray(constraint_rows, dtype=float).reshape(-1, 2)
+    bounds = np.asarray(constraint_bounds, dtype=float).reshape(-1)
+    grid_action = _grid_least_violating_bounded_action(
+        target,
+        constraint_rows,
+        constraint_bounds,
+        ax_bounds,
+        ay_bounds,
+    )
+    grid_scores = _score_constraint_violation(rows, bounds, grid_action)
+    linprog_action, linprog_info = _linprog_minimax_bounded_action(
+        namespace,
+        target,
+        rows,
+        bounds,
+        lb_action,
+        ub_action,
+    )
+    linprog_scores = _score_constraint_violation(rows, bounds, linprog_action)
+    continuous_action, continuous_info = _continuous_least_violating_bounded_action(
+        namespace,
+        target,
+        rows,
+        bounds,
+        lb_action,
+        ub_action,
+        linprog_action,
+    )
+    continuous_scores = _score_constraint_violation(rows, bounds, continuous_action)
+    if rows.size == 0:
+        info = {
+            "soft_qp_success": True,
+            "soft_qp_used": False,
+            "soft_qp_error": "",
+            "soft_qp_slack_l2": 0.0,
+            "soft_qp_slack_max": 0.0,
+            "fallback_source": "no_constraints",
+            "linprog_success": bool(linprog_info.get("linprog_success", False)),
+            "linprog_error": str(linprog_info.get("linprog_error", "")),
+            "continuous_success": bool(continuous_info.get("continuous_success", False)),
+            "continuous_error": str(continuous_info.get("continuous_error", "")),
+            **grid_scores,
+        }
+        return target.astype(np.float32), info
+
+    solution = None
+    soft_error = ""
+    m_constraints = int(rows.shape[0])
+    try:
+        sparse = namespace["sparse"]
+        solve_qp = namespace["solve_qp"]
+        action_weight = float(namespace.get("CBF_SOFT_QP_ACTION_WEIGHT", 1.0))
+        slack_weight = float(namespace.get("CBF_SOFT_QP_SLACK_WEIGHT", 5_000.0))
+        slack_upper = float(namespace.get("CBF_SOFT_QP_SLACK_UPPER", 1_000.0))
+        dim = 2 + m_constraints
+        p_diag = np.r_[
+            np.full(2, 2.0 * action_weight, dtype=float),
+            np.full(m_constraints, 2.0 * slack_weight, dtype=float),
+        ]
+        p_matrix = sparse.diags(p_diag, format="csc")
+        q_vector = np.r_[-2.0 * action_weight * target, np.zeros(m_constraints, dtype=float)]
+        g_matrix = np.zeros((m_constraints, dim), dtype=float)
+        g_matrix[:, :2] = rows
+        g_matrix[np.arange(m_constraints), 2 + np.arange(m_constraints)] = -1.0
+        lower = np.r_[lb_action, np.zeros(m_constraints, dtype=float)]
+        upper = np.r_[ub_action, np.full(m_constraints, slack_upper, dtype=float)]
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=r"OSQP exited.*")
+            solution = solve_qp(
+                p_matrix,
+                q_vector,
+                G=sparse.csc_matrix(g_matrix),
+                h=bounds.astype(float),
+                lb=lower,
+                ub=upper,
+                solver=namespace.get("CBF_QP_SOLVER", "osqp"),
+                verbose=False,
+            )
+    except Exception as exc:
+        soft_error = repr(exc)
+
+    soft_success = solution is not None and bool(np.all(np.isfinite(solution)))
+    if soft_success:
+        solution = np.asarray(solution, dtype=float).reshape(-1)
+        soft_action = np.clip(solution[:2], lb_action, ub_action)
+        soft_slack = np.maximum(solution[2:], 0.0)
+        soft_scores = _score_constraint_violation(rows, bounds, soft_action)
+        soft_score = (
+            soft_scores["max_constraint_violation"],
+            soft_scores["positive_violation_l2"],
+            float(np.sum((soft_action - target) ** 2)),
+        )
+        grid_score = (
+            grid_scores["max_constraint_violation"],
+            grid_scores["positive_violation_l2"],
+            float(np.sum((grid_action.astype(float) - target) ** 2)),
+        )
+        if grid_score < soft_score:
+            best_action = grid_action.astype(float)
+            best_scores = grid_scores
+            fallback_source = "grid_refinement"
+        else:
+            best_action = soft_action
+            best_scores = soft_scores
+            fallback_source = "soft_qp"
+        linprog_score = (
+            linprog_scores["max_constraint_violation"],
+            linprog_scores["positive_violation_l2"],
+            float(np.sum((linprog_action.astype(float) - target) ** 2)),
+        )
+        current_score = (
+            best_scores["max_constraint_violation"],
+            best_scores["positive_violation_l2"],
+            float(np.sum((np.asarray(best_action, dtype=float) - target) ** 2)),
+        )
+        if linprog_score < current_score:
+            best_action = linprog_action.astype(float)
+            best_scores = linprog_scores
+            fallback_source = "linprog_minimax"
+        continuous_score = (
+            continuous_scores["max_constraint_violation"],
+            continuous_scores["positive_violation_l2"],
+            float(np.sum((continuous_action.astype(float) - target) ** 2)),
+        )
+        current_score = (
+            best_scores["max_constraint_violation"],
+            best_scores["positive_violation_l2"],
+            float(np.sum((np.asarray(best_action, dtype=float) - target) ** 2)),
+        )
+        if continuous_score < current_score:
+            best_action = continuous_action.astype(float)
+            best_scores = continuous_scores
+            fallback_source = "continuous_refinement"
+        info = {
+            "soft_qp_success": True,
+            "soft_qp_used": True,
+            "soft_qp_error": "",
+            "soft_qp_slack_l2": float(np.linalg.norm(soft_slack)),
+            "soft_qp_slack_max": float(np.max(soft_slack)) if soft_slack.size else 0.0,
+            "fallback_source": fallback_source,
+            "linprog_success": bool(linprog_info.get("linprog_success", False)),
+            "linprog_error": str(linprog_info.get("linprog_error", "")),
+            "continuous_success": bool(continuous_info.get("continuous_success", False)),
+            "continuous_error": str(continuous_info.get("continuous_error", "")),
+            **best_scores,
+        }
+        return np.asarray(best_action, dtype=np.float32), info
+
+    continuous_score = (
+        continuous_scores["max_constraint_violation"],
+        continuous_scores["positive_violation_l2"],
+        float(np.sum((continuous_action.astype(float) - target) ** 2)),
+    )
+    grid_score = (
+        grid_scores["max_constraint_violation"],
+        grid_scores["positive_violation_l2"],
+        float(np.sum((grid_action.astype(float) - target) ** 2)),
+    )
+    if continuous_score < grid_score:
+        fallback_action = continuous_action.astype(np.float32)
+        fallback_source = "continuous_after_soft_qp_failure"
+        fallback_scores = continuous_scores
+    else:
+        fallback_action = grid_action.astype(np.float32)
+        fallback_source = "grid_after_soft_qp_failure"
+        fallback_scores = grid_scores
+    linprog_score = (
+        linprog_scores["max_constraint_violation"],
+        linprog_scores["positive_violation_l2"],
+        float(np.sum((linprog_action.astype(float) - target) ** 2)),
+    )
+    current_score = (
+        fallback_scores["max_constraint_violation"],
+        fallback_scores["positive_violation_l2"],
+        float(np.sum((fallback_action.astype(float) - target) ** 2)),
+    )
+    if linprog_score < current_score:
+        fallback_action = linprog_action.astype(np.float32)
+        fallback_source = "linprog_after_soft_qp_failure"
+        fallback_scores = linprog_scores
+    info = {
+        "soft_qp_success": False,
+        "soft_qp_used": True,
+        "soft_qp_error": soft_error,
+        "soft_qp_slack_l2": np.nan,
+        "soft_qp_slack_max": np.nan,
+        "fallback_source": fallback_source,
+        "linprog_success": bool(linprog_info.get("linprog_success", False)),
+        "linprog_error": str(linprog_info.get("linprog_error", "")),
+        "continuous_success": bool(continuous_info.get("continuous_success", False)),
+        "continuous_error": str(continuous_info.get("continuous_error", "")),
+        **fallback_scores,
+    }
+    return fallback_action.astype(np.float32), info
+
+
+def _install_robust_cbf_fallback(namespace: dict[str, Any]) -> None:
+    current = namespace.get("_least_violating_bounded_action")
+    if getattr(current, "_robust_cbf_fallback", False):
+        return
+    if current is not None and "_grid_least_violating_bounded_action_original" not in namespace:
+        namespace["_grid_least_violating_bounded_action_original"] = current
+
+    def robust_least_violating_bounded_action(
+        a_rl: np.ndarray,
+        constraint_rows: list[np.ndarray],
+        constraint_bounds: list[float],
+        ax_bounds: tuple[float, float],
+        ay_bounds: tuple[float, float],
+    ) -> np.ndarray:
+        action, _ = _soft_least_violating_bounded_action(
+            namespace,
+            a_rl,
+            constraint_rows,
+            constraint_bounds,
+            ax_bounds,
+            ay_bounds,
+        )
+        return action.astype(np.float32)
+
+    robust_least_violating_bounded_action._robust_cbf_fallback = True  # type: ignore[attr-defined]
+    namespace["_least_violating_bounded_action"] = robust_least_violating_bounded_action
+    namespace["cbf_soft_fallback_projection"] = lambda *args, **kwargs: _soft_least_violating_bounded_action(
+        namespace,
+        *args,
+        **kwargs,
+    )
+
+
 def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
     original_filter = namespace.get("cbf_filter_2d")
     pairwise_constraint = namespace.get("pairwise_hocbf_constraint")
@@ -284,8 +698,24 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
         if raw_is_feasible:
             qp_success = True
             a_safe = a_rl.copy()
+            fallback_info: dict[str, Any] = {
+                "soft_qp_success": False,
+                "soft_qp_used": False,
+                "soft_qp_error": "",
+                "soft_qp_slack_l2": 0.0,
+                "soft_qp_slack_max": 0.0,
+                "fallback_source": "none",
+            }
         else:
             solution = None
+            fallback_info = {
+                "soft_qp_success": False,
+                "soft_qp_used": False,
+                "soft_qp_error": "",
+                "soft_qp_slack_l2": np.nan,
+                "soft_qp_slack_max": np.nan,
+                "fallback_source": "none",
+            }
             try:
                 sparse = namespace["sparse"]
                 solve_qp = namespace["solve_qp"]
@@ -309,6 +739,14 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
             qp_success = solution is not None and bool(np.all(np.isfinite(solution)))
             if qp_success:
                 a_safe = np.clip(np.asarray(solution, dtype=float).reshape(-1)[:2], low, high)
+            elif "cbf_soft_fallback_projection" in namespace:
+                a_safe, fallback_info = namespace["cbf_soft_fallback_projection"](
+                    a_rl,
+                    rows,
+                    bounds,
+                    ax_bounds,
+                    ay_bounds,
+                )
             elif "_least_violating_bounded_action" in namespace:
                 a_safe = namespace["_least_violating_bounded_action"](
                     a_rl,
@@ -317,8 +755,10 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
                     ax_bounds,
                     ay_bounds,
                 )
+                fallback_info["fallback_source"] = "legacy_grid"
             else:
                 a_safe = np.asarray([float(ax_bounds[0]), 0.0], dtype=float)
+                fallback_info["fallback_source"] = "emergency_brake"
 
         safe = np.asarray(a_safe, dtype=np.float32).reshape(-1)[:2]
         safe_constraint_values = rows_arr @ safe - bounds_arr
@@ -364,6 +804,20 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
             "qp_success": bool(qp_success),
             "fallback_used": fallback_used,
             "qp_error": qp_error,
+            "soft_qp_success": bool(fallback_info.get("soft_qp_success", False)),
+            "soft_qp_used": bool(fallback_info.get("soft_qp_used", False)),
+            "soft_qp_error": str(fallback_info.get("soft_qp_error", "")),
+            "soft_qp_slack_l2": float(fallback_info.get("soft_qp_slack_l2", 0.0)),
+            "soft_qp_slack_max": float(fallback_info.get("soft_qp_slack_max", 0.0)),
+            "fallback_source": str(fallback_info.get("fallback_source", "none")),
+            "linprog_fallback_success": bool(fallback_info.get("linprog_success", False)),
+            "linprog_fallback_error": str(fallback_info.get("linprog_error", "")),
+            "continuous_fallback_success": bool(fallback_info.get("continuous_success", False)),
+            "continuous_fallback_error": str(fallback_info.get("continuous_error", "")),
+            "fallback_max_constraint_violation": float(
+                fallback_info.get("max_constraint_violation", np.max(safe_constraint_values) if len(safe_constraint_values) else 0.0)
+            ),
+            "fallback_positive_violation_l2": float(fallback_info.get("positive_violation_l2", 0.0)),
             "num_neighbor_constraints": int(neighbor_constraints),
             "left_boundary_h": float(h_left),
             "right_boundary_h": float(h_right),
@@ -425,6 +879,20 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
                 "cbf_qp_success": bool(filter_info["qp_success"]),
                 "cbf_fallback_used": bool(filter_info.get("fallback_used", not filter_info["qp_success"])),
                 "cbf_qp_error": str(filter_info["qp_error"]),
+                "cbf_soft_qp_success": bool(filter_info.get("soft_qp_success", False)),
+                "cbf_soft_qp_used": bool(filter_info.get("soft_qp_used", False)),
+                "cbf_soft_qp_error": str(filter_info.get("soft_qp_error", "")),
+                "cbf_soft_qp_slack_l2": float(filter_info.get("soft_qp_slack_l2", 0.0)),
+                "cbf_soft_qp_slack_max": float(filter_info.get("soft_qp_slack_max", 0.0)),
+                "cbf_fallback_source": str(filter_info.get("fallback_source", "none")),
+                "cbf_linprog_fallback_success": bool(filter_info.get("linprog_fallback_success", False)),
+                "cbf_linprog_fallback_error": str(filter_info.get("linprog_fallback_error", "")),
+                "cbf_continuous_fallback_success": bool(filter_info.get("continuous_fallback_success", False)),
+                "cbf_continuous_fallback_error": str(filter_info.get("continuous_fallback_error", "")),
+                "cbf_fallback_max_constraint_violation": float(
+                    filter_info.get("fallback_max_constraint_violation", filter_info.get("max_constraint_violation_safe", 0.0))
+                ),
+                "cbf_fallback_positive_violation_l2": float(filter_info.get("fallback_positive_violation_l2", 0.0)),
                 "cbf_num_neighbor_constraints": int(filter_info["num_neighbor_constraints"]),
                 "cbf_min_boundary_h": float(filter_info["min_boundary_h"]),
                 "cbf_left_boundary_h": float(filter_info["left_boundary_h"]),
@@ -821,6 +1289,9 @@ class GuidedCBFDDPG(DDPG):
 def install_minimal_guided_cbf(namespace: dict[str, Any]) -> None:
     """Install minimal guided-CBF definitions into a notebook-derived namespace."""
 
+    namespace.setdefault("CBF_SOFT_QP_ACTION_WEIGHT", 1.0)
+    namespace.setdefault("CBF_SOFT_QP_SLACK_WEIGHT", 5_000.0)
+    namespace.setdefault("CBF_SOFT_QP_SLACK_UPPER", 1_000.0)
     namespace.setdefault("GUIDED_CBF_LAMBDA_BC", 0.10)
     namespace.setdefault("GUIDED_CBF_BC_DELTA", 0.03)
     namespace.setdefault("GUIDED_CBF_ACTION_SCALE", 1.0)
@@ -831,6 +1302,7 @@ def install_minimal_guided_cbf(namespace: dict[str, Any]) -> None:
     namespace.setdefault("GUIDED_CBF_ACTOR_ACTION_MODE", "raw")
     namespace.setdefault("GUIDED_CBF_DIFF_PROJECTION_STEPS", 2)
     namespace.setdefault("GUIDED_CBF_DIFF_PROJECTION_FD_STEP", 1e-3)
+    _install_robust_cbf_fallback(namespace)
     namespace["install_cbf_projection_reporting"] = lambda: _install_cbf_projection_reporting(namespace)
     if bool(namespace.get("GUIDED_CBF_ENABLE_PROJECTION_REPORTING", False)):
         _install_cbf_projection_reporting(namespace)
