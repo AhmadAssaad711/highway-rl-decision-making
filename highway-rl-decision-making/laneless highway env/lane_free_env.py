@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import gymnasium as gym
@@ -415,7 +416,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 accelerations[0, 0] = self._map_action(action_array[0], "longitudinal")
                 accelerations[0, 1] = self._map_action(action_array[1], "lateral") + self._boundary_force(self.vehicle)
             accelerations = self._clip_accelerations(accelerations)
-            self._last_accelerations = accelerations.copy()
+            self._last_accelerations = accelerations
             self._integrate(accelerations, dt)
             self._detect_collisions()
             self.steps += 1
@@ -436,7 +437,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
             low, high = float(bounds["ax_min"]), float(bounds["ax_max"])
         else:
             low, high = float(bounds["ay_min"]), float(bounds["ay_max"])
-        value = float(np.clip(value, -1.0, 1.0))
+        value = min(max(float(value), -1.0), 1.0)
         if low < 0.0 < high:
             scale = high if value >= 0.0 else abs(low)
             return value * max(scale, 1e-6)
@@ -450,18 +451,36 @@ class LaneFreeTrafficEnv(AbstractEnv):
 
     def _compute_force_accelerations(self) -> np.ndarray:
         vehicles = self.road.vehicles
-        force = self.config["force"]
-        accelerations = np.zeros((len(vehicles), 2), dtype=float)
+        force = self.config['force']
+        count = len(vehicles)
+        accelerations = np.zeros((count, 2), dtype=float)
         self._last_mtm_diagnostics = {}
 
-        for i, vehicle in enumerate(vehicles):
-            accelerations[i, 0] += float(force["k_target_x"]) * np.tanh(
-                (vehicle.desired_speed - vehicle.vx) / max(float(force["sigma_x"]), 1e-6)
-            )
-            accelerations[i, 1] += -float(force["k_target_y"]) * np.tanh(
-                vehicle.vy / max(float(force["sigma_y"]), 1e-6)
-            )
-            accelerations[i, 1] += self._boundary_force(vehicle)
+        if count == 0:
+            return accelerations
+
+        x = np.fromiter((vehicle.position[0] for vehicle in vehicles), dtype=float, count=count)
+        y = np.fromiter((vehicle.position[1] for vehicle in vehicles), dtype=float, count=count)
+        vx = np.fromiter((vehicle.vx for vehicle in vehicles), dtype=float, count=count)
+        vy = np.fromiter((vehicle.vy for vehicle in vehicles), dtype=float, count=count)
+        lengths = np.fromiter((vehicle.length for vehicle in vehicles), dtype=float, count=count)
+        widths = np.fromiter((vehicle.width for vehicle in vehicles), dtype=float, count=count)
+        desired_speeds = np.fromiter((vehicle.desired_speed for vehicle in vehicles), dtype=float, count=count)
+
+        accelerations[:, 0] = float(force["k_target_x"]) * np.tanh(
+            (desired_speeds - vx) / max(float(force["sigma_x"]), 1e-6)
+        )
+        accelerations[:, 1] = -float(force["k_target_y"]) * np.tanh(
+            vy / max(float(force["sigma_y"]), 1e-6)
+        )
+        road_width = float(self.config["road_width"])
+        boundary_eps = 1e-3
+        left_clearance = np.maximum(y - 0.5 * widths, boundary_eps)
+        right_clearance = np.maximum(road_width - 0.5 * widths - y, boundary_eps)
+        accelerations[:, 1] += float(force["k_boundary"]) * (
+            1.0 / (left_clearance + boundary_eps) ** 2
+            - 1.0 / (right_clearance + boundary_eps) ** 2
+        )
 
         sensing_range = float(self.config["sensing_range"])
         gamma_nudge = float(self.config["gamma_nudge"])
@@ -470,37 +489,186 @@ class LaneFreeTrafficEnv(AbstractEnv):
         t_x = float(force["T_x"])
         t_y = float(force["T_y"])
 
-        for i, upstream in enumerate(vehicles):
-            for j, downstream in enumerate(vehicles):
-                if i == j:
-                    continue
-                dx = self._forward_distance(upstream.position[0], downstream.position[0])
-                if not (0.0 < dx < sensing_range):
-                    continue
+        road_length = float(self.config["road_length"])
+        dx = (x[None, :] - x[:, None]) % road_length
+        dy = y[None, :] - y[:, None]
+        valid_pairs = (dx > 0.0) & (dx < sensing_range) & ~np.eye(count, dtype=bool)
 
-                dy = float(downstream.position[1] - upstream.position[1])
-                dx_scale = 0.5 * (upstream.length + downstream.length) + t_x * max(upstream.vx - downstream.vx, 0.0)
-                dvy = downstream.vy - upstream.vy
-                v_close_y = max(0.0, -(dy * dvy) / (abs(dy) + 1e-6))
-                dy_scale = 0.5 * (upstream.width + downstream.width) + t_y * v_close_y
-                dx_scale = max(dx_scale, 1e-6)
-                dy_scale = max(dy_scale, 1e-6)
+        dx_scale = (
+            0.5 * (lengths[:, None] + lengths[None, :])
+            + t_x * np.maximum(vx[:, None] - vx[None, :], 0.0)
+        )
+        dvy = vy[None, :] - vy[:, None]
+        v_close_y = np.maximum(0.0, -(dy * dvy) / (np.abs(dy) + 1e-6))
+        dy_scale = 0.5 * (widths[:, None] + widths[None, :]) + t_y * v_close_y
+        dx_scale = np.maximum(dx_scale, 1e-6)
+        dy_scale = np.maximum(dy_scale, 1e-6)
 
-                potential = float(np.exp(-((dx / dx_scale) ** 2) - ((dy / dy_scale) ** 2)))
-                norm = float(np.sqrt(dx * dx + dy * dy) + 1e-6)
-                ux = dx / norm
-                uy = dy / norm
+        potential = np.exp(-((dx / dx_scale) ** 2) - ((dy / dy_scale) ** 2))
+        potential *= valid_pairs
+        norm = np.sqrt(dx * dx + dy * dy) + 1e-6
+        ux = dx / norm
+        uy = dy / norm
+        longitudinal_effect = potential * ux
+        lateral_effect = potential * uy
 
-                accelerations[i, 0] += -k_rep * potential * ux
-                accelerations[i, 1] += -k_rep * potential * uy
+        accelerations[:, 0] -= k_rep * np.sum(longitudinal_effect, axis=1)
+        accelerations[:, 1] -= k_rep * np.sum(lateral_effect, axis=1)
 
-                blocked = max(upstream.desired_speed - upstream.vx, 0.0)
-                accelerations[j, 0] += gamma_nudge * k_nudge * blocked * potential * ux
-                accelerations[j, 1] += gamma_nudge * k_nudge * blocked * potential * uy
+        if gamma_nudge != 0.0 and k_nudge != 0.0:
+            blocked = np.maximum(desired_speeds - vx, 0.0)[:, None]
+            nudge_scale = gamma_nudge * k_nudge
+            accelerations[:, 0] += nudge_scale * np.sum(blocked * longitudinal_effect, axis=0)
+            accelerations[:, 1] += nudge_scale * np.sum(blocked * lateral_effect, axis=0)
 
         return accelerations
 
     def _compute_mtm_accelerations(self) -> np.ndarray:
+        vehicles = self.road.vehicles
+        count = len(vehicles)
+        if count == 0:
+            self._last_mtm_diagnostics = {}
+            return np.zeros((0, 2), dtype=float)
+
+        x = np.fromiter((vehicle.position[0] for vehicle in vehicles), dtype=float, count=count)
+        y = np.fromiter((vehicle.position[1] for vehicle in vehicles), dtype=float, count=count)
+        vx = np.fromiter((vehicle.vx for vehicle in vehicles), dtype=float, count=count)
+        vy = np.fromiter((vehicle.vy for vehicle in vehicles), dtype=float, count=count)
+        lengths = np.fromiter((vehicle.length for vehicle in vehicles), dtype=float, count=count)
+        widths = np.fromiter((vehicle.width for vehicle in vehicles), dtype=float, count=count)
+        desired_speeds = np.fromiter((vehicle.desired_speed for vehicle in vehicles), dtype=float, count=count)
+        is_ego = np.fromiter((vehicle.is_ego for vehicle in vehicles), dtype=bool, count=count)
+
+        parameter_names = (
+            "theta",
+            "s_y0",
+            "tilde_s_y0",
+            "tau",
+            "lambda",
+            "lambda_delta_vy",
+            "p",
+            "a_max",
+            "comfortable_decel",
+            "time_gap",
+            "min_gap",
+            "leader_range",
+        )
+        parameter_rows = [self._mtm_params_for_vehicle(vehicle) for vehicle in vehicles]
+        parameters = {
+            name: np.fromiter((row[name] for row in parameter_rows), dtype=float, count=count)
+            for name in parameter_names
+        }
+        state = np.column_stack((x, y, vx, vy, lengths, widths, desired_speeds))
+        parameter_matrix = np.column_stack(tuple(parameters.values()))
+        if not (np.all(np.isfinite(state)) and np.all(np.isfinite(parameter_matrix))):
+            return self._compute_mtm_accelerations_scalar()
+
+        desired_safe = np.maximum(desired_speeds, 1e-6)
+        a_max = np.maximum(parameters["a_max"], 1e-6)
+        comfortable_decel = np.maximum(parameters["comfortable_decel"], 1e-6)
+        free_accel = a_max * (1.0 - (np.maximum(vx, 0.0) / desired_safe) ** 4)
+
+        road_length = float(self.config["road_length"])
+        dx = (x[None, :] - x[:, None]) % road_length
+        dy = y[None, :] - y[:, None]
+        valid = (
+            (dx > 0.0)
+            & (dx < parameters["leader_range"][:, None])
+            & ~np.eye(count, dtype=bool)
+        )
+        gap_x = np.maximum(dx - 0.5 * (lengths[:, None] + lengths[None, :]), 0.05)
+        lateral_gap = np.maximum(
+            np.abs(dy) - parameters["theta"][:, None] * 0.5 * (widths[:, None] + widths[None, :]),
+            0.0,
+        )
+        alpha = np.minimum(
+            np.exp(-lateral_gap / np.maximum(parameters["s_y0"][:, None], 1e-6)),
+            1.0,
+        )
+        alpha_tilde = np.minimum(
+            np.exp(-lateral_gap / np.maximum(parameters["tilde_s_y0"][:, None], 1e-6)),
+            1.0,
+        )
+
+        delta_v = vx[:, None] - vx[None, :]
+        dynamic_gap = (
+            vx[:, None] * parameters["time_gap"][:, None]
+            + vx[:, None] * delta_v / (2.0 * np.sqrt(a_max * comfortable_decel)[:, None])
+        )
+        desired_gap = parameters["min_gap"][:, None] + np.maximum(dynamic_gap, 0.0)
+        speed_ratio = np.clip(np.maximum(vx, 0.0) / desired_safe, 0.0, 10.0)
+        gap_term = (desired_gap / gap_x) ** 2
+        car_following = np.clip(
+            a_max[:, None] * (1.0 - speed_ratio[:, None] ** 4 - gap_term),
+            -50.0,
+            50.0,
+        )
+        interaction = car_following - free_accel[:, None]
+        traffic = alpha * interaction
+        candidate = valid & ((alpha > 1e-6) | (alpha_tilde > 1e-6))
+
+        traffic_magnitude = np.where(candidate, np.abs(traffic), -np.inf)
+        strongest_indices = np.argmax(traffic_magnitude, axis=1)
+        has_leader = np.any(candidate, axis=1)
+        row_indices = np.arange(count)
+        strongest_traffic = np.where(has_leader, traffic[row_indices, strongest_indices], 0.0)
+        leader_gaps = np.where(has_leader, gap_x[row_indices, strongest_indices], 0.0)
+
+        obstruction = np.maximum(-interaction, 0.0)
+        away_direction = np.where(
+            np.abs(dy) > 1e-6,
+            -np.sign(dy),
+            np.where(y[:, None] <= 0.5 * float(self.config["road_width"]), 1.0, -1.0),
+        )
+        dy_sign = np.where(dy > 0.0, 1.0, np.where(dy < 0.0, -1.0, 0.0))
+        relative_vy = vy[None, :] - vy[:, None]
+        relative_lateral_factor = np.clip(
+            1.0 - parameters["lambda_delta_vy"][:, None] * relative_vy * dy_sign,
+            0.0,
+            2.5,
+        )
+        politeness_scale = np.clip(1.0 - 0.25 * parameters["p"], 0.5, 1.2)
+        lateral_increments = (
+            parameters["lambda"][:, None]
+            * politeness_scale[:, None]
+            * alpha_tilde
+            * obstruction
+            * away_direction
+            * relative_lateral_factor
+        )
+        lateral_increments = np.where(candidate & (obstruction > 0.0), lateral_increments, 0.0)
+        desired_vy = np.sum(lateral_increments, axis=1)
+
+        boundary_forces = np.fromiter(
+            (self._boundary_force(vehicle) for vehicle in vehicles),
+            dtype=float,
+            count=count,
+        )
+        accelerations = np.column_stack(
+            (
+                free_accel + strongest_traffic,
+                (desired_vy - vy) / np.maximum(parameters["tau"], 1e-6) + boundary_forces,
+            )
+        )
+        ego_controlled = bool(self.config["ego_controlled"])
+        driven = ~(is_ego & ego_controlled)
+        accelerations[~driven, 0] = 0.0
+        accelerations[~driven, 1] = boundary_forces[~driven]
+
+        driven_count = max(int(np.count_nonzero(driven)), 1)
+        driven_has_leader = has_leader & driven
+        driven_desired_vy = desired_vy[driven]
+        driven_vy = np.abs(vy[driven])
+        self._last_mtm_diagnostics = {
+            "active_leader_rate": float(np.count_nonzero(driven_has_leader) / driven_count),
+            "mean_abs_vy": float(np.mean(driven_vy)) if driven_vy.size else 0.0,
+            "mean_abs_desired_vy": float(np.mean(np.abs(driven_desired_vy))) if driven_desired_vy.size else 0.0,
+            "mean_leader_gap": float(np.mean(leader_gaps[driven_has_leader])) if np.any(driven_has_leader) else 0.0,
+            "max_abs_desired_vy": float(np.max(np.abs(driven_desired_vy))) if driven_desired_vy.size else 0.0,
+        }
+        return accelerations
+
+    def _compute_mtm_accelerations_scalar(self) -> np.ndarray:
         vehicles = self.road.vehicles
         accelerations = np.zeros((len(vehicles), 2), dtype=float)
         desired_vy_values: list[float] = []
@@ -740,15 +908,15 @@ class LaneFreeTrafficEnv(AbstractEnv):
             vehicle.ay = float(ay)
             vehicle.step(dt)
             vehicle.position[0] = float(vehicle.position[0] % road_length)
-            vehicle.vx = float(np.clip(vehicle.vx, 0.0, max_speed))
+            vehicle.vx = float(min(max(vehicle.vx, 0.0), max_speed))
             max_lateral_speed = lateral_ratio * max(vehicle.vx, 1.0)
-            vehicle.vy = float(np.clip(vehicle.vy, -max_lateral_speed, max_lateral_speed))
+            vehicle.vy = float(min(max(vehicle.vy, -max_lateral_speed), max_lateral_speed))
 
             y_min = vehicle.width / 2.0
             y_max = road_width - vehicle.width / 2.0
             if vehicle.position[1] < y_min or vehicle.position[1] > y_max:
                 boundary_violations += 1
-                vehicle.position[1] = float(np.clip(vehicle.position[1], y_min, y_max))
+                vehicle.position[1] = float(min(max(vehicle.position[1], y_min), y_max))
                 vehicle.vy = 0.0
             vehicle._sync_graphics_fields()
 
@@ -758,47 +926,44 @@ class LaneFreeTrafficEnv(AbstractEnv):
         self._last_boundary_violations = boundary_violations
 
     def _detect_collisions(self) -> None:
-        active_pairs: set[tuple[int, int]] = set()
-        ego_collision = False
         vehicles = self.road.vehicles
-        snapshots: list[tuple[float, float, float, float, bool] | None] = []
-        for vehicle in vehicles:
-            vehicle.crashed = False
+        count = len(vehicles)
+        snapshots = np.full((count, 4), np.nan, dtype=float)
+        is_ego = np.zeros(count, dtype=bool)
+        for index, vehicle in enumerate(vehicles):
+            is_ego[index] = bool(vehicle.is_ego)
             try:
-                x = float(vehicle.position[0])
-                y = float(vehicle.position[1])
-                length = float(vehicle.length)
-                width = float(vehicle.width)
+                snapshots[index] = (
+                    float(vehicle.position[0]),
+                    float(vehicle.position[1]),
+                    float(vehicle.length),
+                    float(vehicle.width),
+                )
             except (TypeError, ValueError, IndexError):
-                snapshots.append(None)
                 continue
-            if not all(np.isfinite(value) for value in [x, y, length, width]):
-                snapshots.append(None)
-                continue
-            snapshots.append((x, y, length, width, bool(vehicle.is_ego)))
 
-        crashed_indices: set[int] = set()
-        for i, first_snapshot in enumerate(snapshots):
-            if first_snapshot is None:
-                continue
-            first_x, first_y, first_length, first_width, first_is_ego = first_snapshot
-            for j in range(i + 1, len(snapshots)):
-                second_snapshot = snapshots[j]
-                if second_snapshot is None:
-                    continue
-                second_x, second_y, second_length, second_width, second_is_ego = second_snapshot
-                dx = abs(self._signed_distance(first_x, second_x))
-                dy = abs(second_y - first_y)
-                if not (np.isfinite(dx) and np.isfinite(dy)):
-                    continue
-                if dx < 0.5 * (first_length + second_length) and dy < 0.5 * (first_width + second_width):
-                    active_pairs.add((i, j))
-                    crashed_indices.update([i, j])
-                    ego_collision = ego_collision or first_is_ego or second_is_ego
+        valid = np.all(np.isfinite(snapshots), axis=1)
+        x, y, lengths, widths = snapshots.T
+        road_length = float(self.config["road_length"])
+        signed_dx = (
+            (x[None, :] - x[:, None] + 0.5 * road_length) % road_length
+        ) - 0.5 * road_length
+        dx = np.abs(signed_dx)
+        dy = np.abs(y[None, :] - y[:, None])
+        colliding = (
+            valid[:, None]
+            & valid[None, :]
+            & (dx < 0.5 * (lengths[:, None] + lengths[None, :]))
+            & (dy < 0.5 * (widths[:, None] + widths[None, :]))
+        )
+        colliding = np.triu(colliding, k=1)
+        pair_indices = np.argwhere(colliding)
+        active_pairs = {(int(first), int(second)) for first, second in pair_indices}
+        crashed = np.any(colliding, axis=0) | np.any(colliding, axis=1)
+        for index, vehicle in enumerate(vehicles):
+            vehicle.crashed = bool(crashed[index])
 
-        for index in crashed_indices:
-            if 0 <= index < len(vehicles):
-                vehicles[index].crashed = True
+        ego_collision = bool(np.any(crashed & is_ego))
 
         new_pairs = active_pairs - self._active_collision_pairs
         self._last_collision_count = len(new_pairs)
@@ -813,15 +978,48 @@ class LaneFreeTrafficEnv(AbstractEnv):
 
     def _observe(self) -> np.ndarray:
         ego = self.vehicle
-        neighbors = sorted(
-            [vehicle for vehicle in self.road.vehicles if vehicle is not ego],
-            key=lambda vehicle: self._distance_to_ego(vehicle),
-        )
-        selected = [ego] + neighbors[: int(self.config["neighbors_count"])]
-        rows = [self._observation_row(vehicle, ego) for vehicle in selected]
-        while len(rows) < 1 + int(self.config["neighbors_count"]):
-            rows.append(np.zeros(7, dtype=np.float32))
-        return np.asarray(rows, dtype=np.float32).reshape(-1)
+        vehicles = self.road.vehicles
+        neighbor_count = int(self.config["neighbors_count"])
+        rows = np.zeros((1 + neighbor_count, 7), dtype=np.float32)
+        if not vehicles:
+            return rows.reshape(-1)
+
+        count = len(vehicles)
+        x = np.fromiter((vehicle.position[0] for vehicle in vehicles), dtype=float, count=count)
+        y = np.fromiter((vehicle.position[1] for vehicle in vehicles), dtype=float, count=count)
+        vx = np.fromiter((vehicle.vx for vehicle in vehicles), dtype=float, count=count)
+        vy = np.fromiter((vehicle.vy for vehicle in vehicles), dtype=float, count=count)
+        lengths = np.fromiter((vehicle.length for vehicle in vehicles), dtype=float, count=count)
+        widths = np.fromiter((vehicle.width for vehicle in vehicles), dtype=float, count=count)
+        desired_speeds = np.fromiter((vehicle.desired_speed for vehicle in vehicles), dtype=float, count=count)
+        ego_index = next((index for index, vehicle in enumerate(vehicles) if vehicle is ego), 0)
+
+        road_length = float(self.config["road_length"])
+        signed_dx = ((x - x[ego_index] + 0.5 * road_length) % road_length) - 0.5 * road_length
+        relative_y = y - y[ego_index]
+        distance_squared = signed_dx * signed_dx + relative_y * relative_y
+        candidate_indices = np.delete(np.arange(count), ego_index)
+        if candidate_indices.size:
+            order = np.argsort(distance_squared[candidate_indices], kind="stable")
+            chosen_neighbors = candidate_indices[order[:neighbor_count]]
+        else:
+            chosen_neighbors = np.empty(0, dtype=int)
+        selected = np.concatenate((np.asarray([ego_index], dtype=int), chosen_neighbors))
+        selected_count = len(selected)
+
+        road_width = max(float(self.config["road_width"]), 1e-6)
+        sensing_range = max(float(self.config["sensing_range"]), 1e-6)
+        observation_vmax = max(float(self.config.get("observation_vmax", 24.0)), 1e-6)
+        observation_vymax = max(float(self.config.get("observation_vymax", 0.3 * observation_vmax)), 1e-6)
+        rows[:selected_count, 0] = np.clip(signed_dx[selected] / sensing_range, -1.0, 1.0)
+        rows[:selected_count, 1] = np.clip(relative_y[selected] / road_width, -1.0, 1.0)
+        rows[:selected_count, 2] = vx[selected] / observation_vmax
+        rows[:selected_count, 3] = vy[selected] / observation_vymax
+        rows[:selected_count, 4] = lengths[selected] / 5.15
+        rows[:selected_count, 5] = widths[selected] / 1.84
+        rows[:selected_count, 6] = desired_speeds[selected] / observation_vmax
+        rows[0, :2] = 0.0
+        return rows.reshape(-1)
 
     def _observation_row(self, vehicle: LaneFreeVehicle, ego: LaneFreeVehicle) -> np.ndarray:
         road_width = float(self.config["road_width"])
@@ -916,13 +1114,13 @@ class LaneFreeTrafficEnv(AbstractEnv):
 
     def _forward_distance(self, x_from: float, x_to: float) -> float:
         road_length = float(self.config["road_length"])
-        if not (np.isfinite(x_from) and np.isfinite(x_to) and np.isfinite(road_length) and road_length > 1e-9):
+        if not (math.isfinite(x_from) and math.isfinite(x_to) and math.isfinite(road_length) and road_length > 1e-9):
             return 0.0
         return float((x_to - x_from) % road_length)
 
     def _signed_distance(self, x_from: float, x_to: float) -> float:
         road_length = float(self.config["road_length"])
-        if not (np.isfinite(x_from) and np.isfinite(x_to) and np.isfinite(road_length) and road_length > 1e-9):
+        if not (math.isfinite(x_from) and math.isfinite(x_to) and math.isfinite(road_length) and road_length > 1e-9):
             return 0.0
         return float(((x_to - x_from + 0.5 * road_length) % road_length) - 0.5 * road_length)
 
