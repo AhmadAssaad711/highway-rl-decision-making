@@ -927,6 +927,7 @@ class GuidedCBFDDPG(DDPG):
         bc_delta: float = 0.03,
         bc_action_scale: float = 1.0,
         bc_weight_max: float = 5.0,
+        bc_loss_mode: str = "weighted_replay",
         use_projected_q: bool = True,
         projected_q_weight: float = 0.0,
         critic_action_mode: str = "raw",
@@ -951,6 +952,7 @@ class GuidedCBFDDPG(DDPG):
         self.bc_delta = float(bc_delta)
         self.bc_action_scale = float(max(bc_action_scale, 1e-6))
         self.bc_weight_max = float(bc_weight_max)
+        self.bc_loss_mode = str(bc_loss_mode).strip().lower()
         self.use_projected_q = bool(use_projected_q)
         self.projected_q_weight = float(np.clip(projected_q_weight, 0.0, 1.0))
         self.critic_action_mode = str(critic_action_mode).strip().lower()
@@ -959,6 +961,11 @@ class GuidedCBFDDPG(DDPG):
             raise ValueError(f"critic_action_mode must be 'raw' or 'safe', got {critic_action_mode!r}")
         if self.actor_action_mode not in {"raw", "diff_cbf"}:
             raise ValueError(f"actor_action_mode must be 'raw' or 'diff_cbf', got {actor_action_mode!r}")
+        if self.bc_loss_mode not in {"weighted_replay", "masked_replay_mse"}:
+            raise ValueError(
+                "bc_loss_mode must be 'weighted_replay' or 'masked_replay_mse', "
+                f"got {bc_loss_mode!r}"
+            )
         self.cbf_projection_steps = int(max(cbf_projection_steps, 1))
         self.cbf_projection_fd_step = float(max(cbf_projection_fd_step, 1e-5))
         self.cbf_road_width = float(cbf_road_width)
@@ -1229,13 +1236,19 @@ class GuidedCBFDDPG(DDPG):
                     bc_loss = bc_per_sample.mean()
                 else:
                     correction = th.norm(replay_data.safe_actions - replay_data.actions, dim=1, keepdim=True)
-                    mask_float = (replay_data.interventions > 0.5).float()
-                    weights = 1.0 + th.clamp(
-                        correction / self.bc_action_scale,
-                        min=0.0,
-                        max=self.bc_weight_max,
-                    )
                     bc_per_sample = ((a_pred - replay_data.safe_actions) ** 2).sum(dim=1, keepdim=True)
+                    if self.bc_loss_mode == "masked_replay_mse":
+                        # Exact replay-target form of L_corr: only meaningful CBF
+                        # corrections supervise the actor, with no extra magnitude weighting.
+                        mask_float = (correction > self.bc_delta).float()
+                        weights = th.ones_like(correction)
+                    else:
+                        mask_float = (replay_data.interventions > 0.5).float()
+                        weights = 1.0 + th.clamp(
+                            correction / self.bc_action_scale,
+                            min=0.0,
+                            max=self.bc_weight_max,
+                        )
                     bc_loss = (mask_float * weights * bc_per_sample).sum() / (mask_float.sum() + 1e-6)
                 lambda_bc_current = self._current_lambda_bc()
                 actor_loss = rl_actor_loss + lambda_bc_current * bc_loss
@@ -1272,6 +1285,7 @@ class GuidedCBFDDPG(DDPG):
             self.logger.record("train/cbf_critic_q_safe_mean", np.mean(critic_safe_q_means))
             self.logger.record("train/cbf_projected_q_weight", self.projected_q_weight)
             self.logger.record("train/cbf_lambda_bc_current", self._current_lambda_bc())
+            self.logger.record("train/cbf_bc_loss_mode_masked_replay", float(self.bc_loss_mode == "masked_replay_mse"))
             self.logger.record("train/cbf_bc_loss", np.mean(bc_losses))
             self.logger.record("train/cbf_bc_mask_rate", np.mean(bc_mask_rates))
             self.logger.record("train/cbf_bc_weight", np.mean(bc_weight_means))

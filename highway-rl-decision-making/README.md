@@ -34,7 +34,7 @@ Full notebook list: [`notebooks/README.md`](notebooks/README.md)
 ## Install
 
 ```powershell
-python -m pip install -r requirements.txt
+py -3.12 -m pip install -r requirements.txt
 ```
 
 ## Notes

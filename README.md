@@ -79,7 +79,7 @@ highway-rl-decision-making/
 ## Setup
 
 ```powershell
-python -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r highway-rl-decision-making\requirements.txt
