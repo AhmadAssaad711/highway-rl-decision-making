@@ -82,6 +82,8 @@ def apply_overrides(namespace: dict[str, Any], args: argparse.Namespace, task: d
     if args.timesteps is not None:
         timesteps = int(args.timesteps)
         namespace[str(task["timesteps_key"])] = timesteps
+        if args.task == "ppo-train":
+            namespace["PPO_PILOT_TIMESTEPS"] = timesteps
         if args.task == "guided-ddpg-cbf-train":
             namespace["DDPG_CBF_TOTAL_TIMESTEPS"] = timesteps
     if args.n_envs is not None:
@@ -239,6 +241,13 @@ def main() -> int:
         )
     else:
         exec_notebook_cell(notebook, notebook_path, int(task["cell"]), namespace)
+    if args.task == "ppo-train":
+        # Cell 11 delegates to the authoritative standalone PPO pilot.  Do not
+        # inspect or archive the legacy MODEL_PATH, which may contain an older
+        # model unrelated to the just-completed parameter screen.
+        print("[notebook-task] completed ppo-train via nominal PPO pilot runner", flush=True)
+        return 0
+
     archived = archive_training_outputs(
         namespace=namespace,
         task_name=args.task,

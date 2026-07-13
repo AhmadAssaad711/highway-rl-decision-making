@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from stable_baselines3 import DDPG, PPO
+
 from laneless_script_config import active_traffic_model, env_config_from_args
 
 
@@ -52,7 +54,12 @@ def apply_cbf_overrides(namespace: dict[str, Any], args: argparse.Namespace) -> 
         namespace["CBF_EPS_SIDE"] = float(args.eps_side)
 
 
-def exec_notebook_cells(notebook_path: Path, cell_indices: list[int], namespace: dict[str, Any]) -> None:
+def exec_notebook_cells(
+    notebook_path: Path,
+    cell_indices: list[int],
+    namespace: dict[str, Any],
+    args: argparse.Namespace | None = None,
+) -> None:
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     for cell_index in cell_indices:
         cell = notebook["cells"][cell_index]
@@ -61,13 +68,7 @@ def exec_notebook_cells(notebook_path: Path, cell_indices: list[int], namespace:
         source = "".join(cell.get("source", []))
         print(f"[evaluate_laneless_karalakou] executing notebook cell {cell_index}", flush=True)
         exec(compile(source, f"{notebook_path}:cell-{cell_index}", "exec"), namespace)
-
-
-) -> None:
-    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    for cell_index in cell_indices:
-        exec_notebook_cell(notebook, notebook_path, cell_index, namespace)
-        if cell_index == 33:
+        if args is not None and cell_index == 33:
             apply_cbf_overrides(namespace, args)
 
 
@@ -128,7 +129,11 @@ def main() -> int:
 
     project_root = find_project_root(args.project_root or Path.cwd())
     notebook_path = project_root / "notebooks" / "lanelessKaralakou.ipynb"
-    namespace: dict[str, Any] = {"__name__": "__main__"}
+    namespace: dict[str, Any] = {
+        "__name__": "__main__",
+        "PPO": PPO,
+        "DDPG": DDPG,
+    }
 
     base_cells = [2, 3, 5, 6, 8]
     cbf_cells = [33, 35, 37, 39, 41, 43]
