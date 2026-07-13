@@ -42,8 +42,11 @@ def find_project_root(start: Path) -> Path:
 def exec_notebook_cells(notebook_path: Path, cell_indices: list[int], namespace: dict[str, Any]) -> None:
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     for cell_index in cell_indices:
-        source = "".join(notebook["cells"][cell_index].get("source", []))
-        print(f"[eps-sweep] executing notebook cell {cell_index}", flush=True)
+        cell = notebook["cells"][cell_index]
+        if cell.get("cell_type") != "code":
+            continue
+        source = "".join(cell.get("source", []))
+        print(f"[cbf_eps_side_eval_sweep] executing notebook cell {cell_index}", flush=True)
         exec(compile(source, f"{notebook_path}:cell-{cell_index}", "exec"), namespace)
 
 
@@ -278,7 +281,7 @@ def main() -> int:
     project_root = find_project_root(args.project_root or Path.cwd())
     notebook_path = project_root / "notebooks" / "lanelessKaralakou.ipynb"
     namespace: dict[str, Any] = {"__name__": "__main__"}
-    exec_notebook_cells(notebook_path, [2, 4, 6, 7, 9, 32, 34, 36, 38, 40, 42], namespace)
+    exec_notebook_cells(notebook_path, [2, 3, 5, 6, 8, 33, 35, 37, 39, 41, 43], namespace)
     namespace["DEVICE"] = args.device
 
     artifact_dir: Path = namespace["ARTIFACT_DIR"]

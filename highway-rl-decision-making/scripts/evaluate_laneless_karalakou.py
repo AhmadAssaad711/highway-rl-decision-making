@@ -52,11 +52,17 @@ def apply_cbf_overrides(namespace: dict[str, Any], args: argparse.Namespace) -> 
         namespace["CBF_EPS_SIDE"] = float(args.eps_side)
 
 
-def exec_notebook_cells(
-    notebook_path: Path,
-    cell_indices: list[int],
-    namespace: dict[str, Any],
-    args: argparse.Namespace,
+def exec_notebook_cells(notebook_path: Path, cell_indices: list[int], namespace: dict[str, Any]) -> None:
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    for cell_index in cell_indices:
+        cell = notebook["cells"][cell_index]
+        if cell.get("cell_type") != "code":
+            continue
+        source = "".join(cell.get("source", []))
+        print(f"[evaluate_laneless_karalakou] executing notebook cell {cell_index}", flush=True)
+        exec(compile(source, f"{notebook_path}:cell-{cell_index}", "exec"), namespace)
+
+
 ) -> None:
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     for cell_index in cell_indices:
@@ -124,9 +130,9 @@ def main() -> int:
     notebook_path = project_root / "notebooks" / "lanelessKaralakou.ipynb"
     namespace: dict[str, Any] = {"__name__": "__main__"}
 
-    base_cells = [2, 4, 6, 7, 9]
-    cbf_cells = [32, 34, 36, 38, 40, 42]
-    guided_cells = [52]
+    base_cells = [2, 3, 5, 6, 8]
+    cbf_cells = [33, 35, 37, 39, 41, 43]
+    guided_cells = [53]
     needs_cbf = args.variant in {"ddpg-cbf", "guided-ddpg-cbf"}
     exec_notebook_cells(
         notebook_path,

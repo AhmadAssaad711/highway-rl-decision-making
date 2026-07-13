@@ -16,7 +16,7 @@ import pandas as pd
 import torch as th
 
 
-NOTEBOOK_DEPS = [2, 4, 6, 7, 9, 32, 34, 36, 38, 40, 42]
+NOTEBOOK_DEPS = [2, 3, 5, 6, 8, 33, 35, 37, 39, 41, 43]
 
 
 def set_stable_native_defaults() -> None:
@@ -45,8 +45,11 @@ def find_project_root(start: Path) -> Path:
 def exec_notebook_cells(notebook_path: Path, cell_indices: list[int], namespace: dict[str, Any]) -> None:
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     for cell_index in cell_indices:
-        source = "".join(notebook["cells"][cell_index].get("source", []))
-        print(f"[calibration] executing notebook cell {cell_index}", flush=True)
+        cell = notebook["cells"][cell_index]
+        if cell.get("cell_type") != "code":
+            continue
+        source = "".join(cell.get("source", []))
+        print(f"[cbf_lambda_gradient_calibration] executing notebook cell {cell_index}", flush=True)
         exec(compile(source, f"{notebook_path}:cell-{cell_index}", "exec"), namespace)
 
 

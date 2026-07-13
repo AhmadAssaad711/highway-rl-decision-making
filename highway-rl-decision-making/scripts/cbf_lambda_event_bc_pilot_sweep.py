@@ -4,10 +4,12 @@ import argparse
 import faulthandler
 import json
 import os
+import sys
 import time
 import warnings
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import gymnasium as gym
 import matplotlib
@@ -17,7 +19,8 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 import numpy as np
 import pandas as pd
-from stable_baselines3.common.callbacks import BaseCallback
+import torch
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
 
 from guided_cbf_minimal import install_minimal_guided_cbf
@@ -26,7 +29,7 @@ from laneless_script_config import active_traffic_model, add_env_config_args, en
 
 warnings.filterwarnings("ignore", message="OSQP exited.*")
 
-NOTEBOOK_DEPS = [2, 4, 6, 7, 9, 32, 34, 36, 38, 40, 42]
+NOTEBOOK_DEPS = [2, 3, 5, 6, 8, 33, 35, 37, 39, 41, 43]
 
 DEFAULT_TRIALS: list[tuple[str, float, float, float]] = [
     ("norm0025_event000_bc000", 0.025, 0.00, 0.00),
@@ -65,8 +68,11 @@ def find_project_root(start: Path) -> Path:
 def exec_notebook_cells(notebook_path: Path, cell_indices: list[int], namespace: dict[str, Any]) -> None:
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     for cell_index in cell_indices:
-        source = "".join(notebook["cells"][cell_index].get("source", []))
-        print(f"[pilot] executing notebook cell {cell_index}", flush=True)
+        cell = notebook["cells"][cell_index]
+        if cell.get("cell_type") != "code":
+            continue
+        source = "".join(cell.get("source", []))
+        print(f"[cbf_lambda_event_bc_pilot_sweep] executing notebook cell {cell_index}", flush=True)
         exec(compile(source, f"{notebook_path}:cell-{cell_index}", "exec"), namespace)
 
 
@@ -546,8 +552,36 @@ def main() -> int:
     args = parse_args()
 
     project_root = find_project_root(args.project_root or Path.cwd())
+    env_dir = project_root / "laneless highway env"
+    if env_dir.exists():
+        sys.path.insert(0, str(env_dir))
+        import lane_free_env  # noqa: F401
     notebook_path = project_root / "notebooks" / "lanelessKaralakou.ipynb"
-    namespace: dict[str, Any] = {"__name__": "__main__"}
+    namespace: dict[str, Any] = {
+        "__name__": "__main__",
+        "ARTIFACT_DIR": project_root / "artifacts" / "lanelessKaralakou",
+        "np": np,
+        "pd": pd,
+        "gym": gym,
+        "torch": torch,
+        "Path": Path,
+        "json": json,
+        "os": os,
+        "sys": sys,
+        "time": time,
+        "warnings": warnings,
+        "datetime": datetime,
+        "Any": Any,
+        "Callable": Callable,
+        "Dict": Dict,
+        "List": List,
+        "Optional": Optional,
+        "Tuple": Tuple,
+        "Union": Union,
+        "BaseCallback": BaseCallback,
+        "CallbackList": CallbackList,
+        "Monitor": Monitor,
+    }
     exec_notebook_cells(notebook_path, NOTEBOOK_DEPS, namespace)
     namespace["DEVICE"] = args.device
     install_minimal_guided_cbf(namespace)
@@ -736,6 +770,7 @@ def main() -> int:
             "ego_collisions_mean",
             "selection_score",
         ]
+        display_cols = [c for c in display_cols if c in aggregate.columns]
         print(aggregate[display_cols].to_string(index=False), flush=True)
     return 0
 

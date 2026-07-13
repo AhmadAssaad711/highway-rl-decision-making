@@ -39,7 +39,10 @@ def find_project_root(start: Path) -> Path:
 
 
 def exec_notebook_cell(notebook: dict[str, Any], notebook_path: Path, cell_index: int, namespace: dict[str, Any]) -> None:
-    source = "".join(notebook["cells"][cell_index].get("source", []))
+    cell = notebook["cells"][cell_index]
+    if cell.get("cell_type") != "code":
+        return
+    source = "".join(cell.get("source", []))
     print(f"[notebook-task] executing notebook cell {cell_index}", flush=True)
     exec(compile(source, f"{notebook_path}:cell-{cell_index}", "exec"), namespace)
 
@@ -62,7 +65,12 @@ def exec_notebook_cell_tail(
 def exec_notebook_cells(notebook_path: Path, cell_indices: list[int], namespace: dict[str, Any]) -> None:
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     for cell_index in cell_indices:
-        exec_notebook_cell(notebook, notebook_path, cell_index, namespace)
+        cell = notebook["cells"][cell_index]
+        if cell.get("cell_type") != "code":
+            continue
+        source = "".join(cell.get("source", []))
+        print(f"[run_laneless_notebook_task] executing notebook cell {cell_index}", flush=True)
+        exec(compile(source, f"{notebook_path}:cell-{cell_index}", "exec"), namespace)
 
 
 def apply_overrides(namespace: dict[str, Any], args: argparse.Namespace, task: dict[str, Any]) -> None:
@@ -138,26 +146,26 @@ def apply_traffic_artifact_suffix(namespace: dict[str, Any], artifact_suffix: st
 
 TASKS = {
     "ppo-train": {
-        "deps": [2, 4, 6, 7, 9, 10],
-        "cell": 12,
+        "deps": [2, 3, 5, 6, 8],
+        "cell": 11,
         "flag": "RUN_PPO_TRAIN",
         "timesteps_key": "TOTAL_TIMESTEPS",
     },
     "ddpg-train": {
-        "deps": [2, 4, 6, 7, 9, 10],
-        "cell": 23,
+        "deps": [2, 3, 5, 6, 8],
+        "cell": 22,
         "flag": "RUN_DDPG_TRAIN",
         "timesteps_key": "DDPG_TOTAL_TIMESTEPS",
     },
     "ddpg-cbf-train": {
-        "deps": [2, 4, 6, 7, 9, 10, 32, 34, 36, 38, 40, 42],
-        "cell": 44,
+        "deps": [2, 3, 5, 6, 8, 31, 33, 35, 37, 41],
+        "cell": 43,
         "flag": "RUN_DDPG_CBF_TRAIN",
         "timesteps_key": "DDPG_CBF_TOTAL_TIMESTEPS",
     },
     "guided-ddpg-cbf-train": {
-        "deps": [2, 4, 6, 7, 9, 10, 32, 34, 36, 38, 40, 42],
-        "cell": 52,
+        "deps": [2, 3, 5, 6, 8, 31, 33, 35, 37, 41],
+        "cell": 51,
         "flag": "RUN_GUIDED_DDPG_CBF_TRAIN",
         "timesteps_key": "GUIDED_DDPG_CBF_TOTAL_TIMESTEPS",
     },
