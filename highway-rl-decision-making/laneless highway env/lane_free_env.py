@@ -203,6 +203,10 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 "terminate_on_collision": True,
                 "gamma_nudge": 0.0,
                 "ego_controlled": True,
+                # Keep the historical lateral boundary-force assist by default.
+                # Formulation experiments can disable only the ego-side assist
+                # while retaining the same traffic and physical road model.
+                "ego_boundary_force": True,
                 "traffic_model": "force",
                 "neighbors_count": 5,
                 "ego_dimensions": cls.EGO_DIMENSIONS.tolist(),
@@ -414,7 +418,14 @@ class LaneFreeTrafficEnv(AbstractEnv):
             accelerations = self._compute_accelerations()
             if bool(self.config["ego_controlled"]):
                 accelerations[0, 0] = self._map_action(action_array[0], "longitudinal")
-                accelerations[0, 1] = self._map_action(action_array[1], "lateral") + self._boundary_force(self.vehicle)
+                ego_boundary_force = (
+                    self._boundary_force(self.vehicle)
+                    if bool(self.config.get("ego_boundary_force", True))
+                    else 0.0
+                )
+                accelerations[0, 1] = (
+                    self._map_action(action_array[1], "lateral") + ego_boundary_force
+                )
             accelerations = self._clip_accelerations(accelerations)
             self._last_accelerations = accelerations
             self._integrate(accelerations, dt)
