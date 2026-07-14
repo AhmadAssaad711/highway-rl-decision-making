@@ -154,7 +154,7 @@ TASKS = {
         "timesteps_key": "TOTAL_TIMESTEPS",
     },
     "ddpg-train": {
-        "deps": [2, 3, 5, 6, 8],
+        "deps": [2, 3, 5, 6, 8, 9],
         "cell": 22,
         "flag": "RUN_DDPG_TRAIN",
         "timesteps_key": "DDPG_TOTAL_TIMESTEPS",

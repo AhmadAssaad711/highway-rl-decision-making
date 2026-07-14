@@ -31,7 +31,7 @@ def load_notebook_namespace(repo_root: Path) -> dict[str, Any]:
     namespace: dict[str, Any] = {}
 
     required_prefixes = [
-        "from __future__ import annotations",
+        "import os",
         "class KaralakouRewardWrapper",
         "ENV_CONFIG = {",
         "class LaneFreeObservationNormalizationWrapper",
