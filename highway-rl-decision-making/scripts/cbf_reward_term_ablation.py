@@ -29,12 +29,13 @@ from cbf_lambda_event_bc_pilot_sweep import (
     install_event_penalty_env,
     set_stable_native_defaults,
 )
+from guided_cbf_minimal import install_minimal_guided_cbf
 from laneless_script_config import active_traffic_model, add_env_config_args, env_config_from_args
 
 
 warnings.filterwarnings("ignore", message="OSQP exited.*")
 
-NOTEBOOK_DEPS = [2, 3, 5, 6, 8, 11, 33, 35, 37, 39, 41, 43, 53]
+NOTEBOOK_DEPS = [2, 3, 5, 6, 8, 11, 33, 35, 37, 39, 41]
 
 DEFAULT_TRIALS: list[dict[str, float | str | bool]] = [
     {
@@ -303,7 +304,7 @@ def make_training_env(
         _single_env,
         seed=seed,
         n_envs=n_envs,
-        use_subproc=False,
+        use_subproc=bool(namespace.get("DDPG_USE_SUBPROC_VEC_ENV", True)),
         start_method=namespace["DDPG_SUBPROC_START_METHOD"],
     )
 
@@ -721,6 +722,7 @@ def main() -> int:
         "Monitor": Monitor,
     }
     exec_notebook_cells(notebook_path, NOTEBOOK_DEPS, namespace)
+    install_minimal_guided_cbf(namespace)
     namespace["DEVICE"] = args.device
     install_safety_set_reward_wrapper(namespace)
     install_event_penalty_env(namespace)
@@ -796,6 +798,10 @@ def main() -> int:
             eps_side=args.eps_side,
             n_envs=args.n_envs,
         )
+        print(
+            f"[reward] vec_env={type(train_env).__name__} | n_envs={args.n_envs} | UTD=1",
+            flush=True,
+        )
         n_actions = train_env.action_space.shape[-1]
         action_noise = namespace["make_ou_action_noise"](n_actions, n_envs=args.n_envs)
         callback = RewardAblationEvalCallback(
@@ -822,7 +828,7 @@ def main() -> int:
             tau=namespace["DDPG_TAU"],
             gamma=namespace["DDPG_GAMMA"],
             train_freq=(1, "step"),
-            gradient_steps=1,
+            gradient_steps=int(namespace.get("DDPG_GRADIENT_STEPS", -1)),
             action_noise=action_noise,
             policy_kwargs={"net_arch": [256, 128]},
             tensorboard_log=None,

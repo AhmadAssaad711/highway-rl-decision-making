@@ -690,11 +690,12 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
         bounds_arr = np.asarray(bounds, dtype=np.float32).reshape(-1)
         rl_constraint_values = rows_arr @ a_rl.astype(np.float32) - bounds_arr
         raw_is_feasible = (
-            bool(np.all(rl_constraint_values <= float(namespace.get("CBF_QP_FEASIBILITY_TOL", 1e-6))))
-            and bool(np.all(a_rl >= low - float(namespace.get("CBF_QP_FEASIBILITY_TOL", 1e-6))))
-            and bool(np.all(a_rl <= high + float(namespace.get("CBF_QP_FEASIBILITY_TOL", 1e-6))))
+            bool(np.all(rl_constraint_values <= float(namespace.get("CBF_QP_FEASIBILITY_TOL", 1e-3))))
+            and bool(np.all(a_rl >= low - float(namespace.get("CBF_QP_FEASIBILITY_TOL", 1e-3))))
+            and bool(np.all(a_rl <= high + float(namespace.get("CBF_QP_FEASIBILITY_TOL", 1e-3))))
         )
         qp_error = ""
+        projection_solver = "raw"
         if raw_is_feasible:
             qp_success = True
             a_safe = a_rl.copy()
@@ -708,6 +709,7 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
             }
         else:
             solution = None
+            direct_error = ""
             fallback_info = {
                 "soft_qp_success": False,
                 "soft_qp_used": False,
@@ -716,49 +718,76 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
                 "soft_qp_slack_max": np.nan,
                 "fallback_source": "none",
             }
-            try:
-                sparse = namespace["sparse"]
-                solve_qp = namespace["solve_qp"]
-                p_matrix = sparse.csc_matrix(2.0 * np.eye(2, dtype=float))
-                q_vector = -2.0 * a_rl
-                g_matrix = sparse.csc_matrix(rows_arr.astype(float))
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", message=r"OSQP exited.*")
-                    solution = solve_qp(
-                        p_matrix,
-                        q_vector,
-                        G=g_matrix,
-                        h=bounds_arr.astype(float),
-                        lb=low.astype(float),
-                        ub=high.astype(float),
-                        solver=namespace.get("CBF_QP_SOLVER", "osqp"),
-                        verbose=False,
+            direct_projector = namespace.get("project_action_to_linear_constraints_2d")
+            if callable(direct_projector):
+                try:
+                    solution = direct_projector(
+                        a_rl,
+                        rows,
+                        bounds,
+                        ax_bounds=ax_bounds,
+                        ay_bounds=ay_bounds,
+                        feasibility_tol=float(namespace.get("CBF_QP_FEASIBILITY_TOL", 1e-3)),
                     )
-            except Exception as exc:
-                qp_error = repr(exc)
+                except Exception as exc:
+                    direct_error = repr(exc)
+
             qp_success = solution is not None and bool(np.all(np.isfinite(solution)))
             if qp_success:
                 a_safe = np.clip(np.asarray(solution, dtype=float).reshape(-1)[:2], low, high)
-            elif "cbf_soft_fallback_projection" in namespace:
-                a_safe, fallback_info = namespace["cbf_soft_fallback_projection"](
-                    a_rl,
-                    rows,
-                    bounds,
-                    ax_bounds,
-                    ay_bounds,
-                )
-            elif "_least_violating_bounded_action" in namespace:
-                a_safe = namespace["_least_violating_bounded_action"](
-                    a_rl,
-                    rows,
-                    bounds,
-                    ax_bounds,
-                    ay_bounds,
-                )
-                fallback_info["fallback_source"] = "legacy_grid"
+                projection_solver = str(namespace.get("CBF_PROJECTION_SOLVER", "active_set_2d"))
             else:
-                a_safe = np.asarray([float(ax_bounds[0]), 0.0], dtype=float)
-                fallback_info["fallback_source"] = "emergency_brake"
+                # The active-set projection is exact in 2D. Retain OSQP only
+                # as a numerical fallback for degenerate or infeasible sets.
+                solution = None
+                try:
+                    sparse = namespace["sparse"]
+                    solve_qp = namespace["solve_qp"]
+                    p_matrix = sparse.csc_matrix(2.0 * np.eye(2, dtype=float))
+                    q_vector = -2.0 * a_rl
+                    g_matrix = sparse.csc_matrix(rows_arr.astype(float))
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", message=r"OSQP exited.*")
+                        solution = solve_qp(
+                            p_matrix,
+                            q_vector,
+                            G=g_matrix,
+                            h=bounds_arr.astype(float),
+                            lb=low.astype(float),
+                            ub=high.astype(float),
+                            solver=namespace.get("CBF_QP_SOLVER", "osqp"),
+                            verbose=False,
+                        )
+                except Exception as exc:
+                    qp_error = repr(exc)
+                qp_success = solution is not None and bool(np.all(np.isfinite(solution)))
+                if qp_success:
+                    a_safe = np.clip(np.asarray(solution, dtype=float).reshape(-1)[:2], low, high)
+                    projection_solver = str(namespace.get("CBF_QP_SOLVER", "osqp"))
+                else:
+                    if not qp_error:
+                        qp_error = direct_error
+                    projection_solver = "fallback"
+                    if "cbf_soft_fallback_projection" in namespace:
+                        a_safe, fallback_info = namespace["cbf_soft_fallback_projection"](
+                            a_rl,
+                            rows,
+                            bounds,
+                            ax_bounds,
+                            ay_bounds,
+                        )
+                    elif "_least_violating_bounded_action" in namespace:
+                        a_safe = namespace["_least_violating_bounded_action"](
+                            a_rl,
+                            rows,
+                            bounds,
+                            ax_bounds,
+                            ay_bounds,
+                        )
+                        fallback_info["fallback_source"] = "legacy_grid"
+                    else:
+                        a_safe = np.asarray([float(ax_bounds[0]), 0.0], dtype=float)
+                        fallback_info["fallback_source"] = "emergency_brake"
 
         safe = np.asarray(a_safe, dtype=np.float32).reshape(-1)[:2]
         safe_constraint_values = rows_arr @ safe - bounds_arr
@@ -801,6 +830,7 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
             "eps_side": float(eps_side),
             "k0": float(k0),
             "k1": float(k1),
+            "projection_solver": str(projection_solver),
             "qp_success": bool(qp_success),
             "fallback_used": fallback_used,
             "qp_error": qp_error,
@@ -876,6 +906,7 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
                 "cbf_eps_side": float(filter_info["eps_side"]),
                 "cbf_k0": float(filter_info.get("k0", self.k0)),
                 "cbf_k1": float(filter_info.get("k1", self.k1)),
+                "cbf_projection_solver": str(filter_info.get("projection_solver", "osqp")),
                 "cbf_qp_success": bool(filter_info["qp_success"]),
                 "cbf_fallback_used": bool(filter_info.get("fallback_used", not filter_info["qp_success"])),
                 "cbf_qp_error": str(filter_info["qp_error"]),

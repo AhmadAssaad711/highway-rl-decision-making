@@ -250,7 +250,7 @@ def install_safety_observation_env(namespace: dict[str, Any]) -> None:
         eps_side: float,
         use_safety_obs: bool,
         n_envs: int,
-        use_subproc: bool = False,
+        use_subproc: bool = bool(namespace.get("DDPG_USE_SUBPROC_VEC_ENV", True)),
         env_config: dict[str, Any] | None = None,
         reward_config: dict[str, float] | None = None,
         normalize_observation: bool | None = None,
@@ -698,8 +698,12 @@ def main() -> int:
             eps_side=args.eps_side,
             use_safety_obs=use_safety_obs,
             n_envs=args.n_envs,
-            use_subproc=False,
+            use_subproc=bool(namespace.get("DDPG_USE_SUBPROC_VEC_ENV", True)),
             env_config=env_config,
+        )
+        print(
+            f"[safety-obs] vec_env={type(train_env).__name__} | n_envs={args.n_envs} | UTD=1",
+            flush=True,
         )
         n_actions = train_env.action_space.shape[-1]
         action_noise = namespace["make_ou_action_noise"](n_actions, n_envs=args.n_envs)
@@ -727,7 +731,7 @@ def main() -> int:
                 tau=namespace["DDPG_TAU"],
                 gamma=namespace["DDPG_GAMMA"],
                 train_freq=(1, "step"),
-                gradient_steps=1,
+                gradient_steps=int(namespace.get("DDPG_GRADIENT_STEPS", -1)),
                 action_noise=action_noise,
                 policy_kwargs={"net_arch": [256, 128]},
                 tensorboard_log=None,

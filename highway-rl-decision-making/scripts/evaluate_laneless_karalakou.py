@@ -10,8 +10,20 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 from stable_baselines3 import DDPG, PPO
 
+from guided_cbf_minimal import install_minimal_guided_cbf
+from laneless_evaluation_registry import (
+    build_evaluation_request,
+    evaluation_cache_paths,
+    latest_completed_training,
+    load_matching_evaluation,
+    sha256_file,
+    stable_json_digest,
+    sync_metrics_to_requested_output,
+    write_evaluation_manifest,
+)
 from laneless_script_config import active_traffic_model, env_config_from_args
 
 
@@ -89,6 +101,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--k0", type=float, default=None)
     parser.add_argument("--k1", type=float, default=None)
     parser.add_argument("--eps-side", type=float, default=None)
+    parser.add_argument(
+        "--use-latest-training",
+        action="store_true",
+        help="Evaluate the latest completed immutable training run and reuse only its matching cached evaluation.",
+    )
+    parser.add_argument(
+        "--force-reevaluate",
+        action="store_true",
+        help="Ignore a matching cached evaluation and run the requested evaluation again.",
+    )
     return parser.parse_args()
 
 
@@ -122,6 +144,42 @@ def artifact_path(path: Path, traffic_model: str, artifact_suffix: str | None) -
     return with_stem_suffix(Path(path), suffix) if suffix else Path(path)
 
 
+def notebook_code_sha256(notebook_path: Path) -> str:
+    """Fingerprint notebook code only, so display-output changes do not invalidate an evaluation."""
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    sources = [
+        "".join(cell.get("source", []))
+        for cell in notebook.get("cells", [])
+        if cell.get("cell_type") == "code"
+    ]
+    return stable_json_digest(sources)
+
+
+def default_model_path(
+    namespace: dict[str, Any],
+    args: argparse.Namespace,
+    traffic_model: str,
+) -> Path:
+    model_key_by_variant = {
+        "ppo": "MODEL_PATH",
+        "ddpg": "DDPG_MODEL_PATH",
+        "ddpg-cbf": "DDPG_CBF_MODEL_PATH",
+        "guided-ddpg-cbf": "GUIDED_DDPG_CBF_MODEL_PATH",
+    }
+    return artifact_path(
+        Path(namespace[model_key_by_variant[args.variant]]),
+        traffic_model,
+        args.artifact_suffix,
+    )
+
+
+def atomic_write_metrics(metrics: pd.DataFrame, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(".tmp")
+    metrics.to_csv(temporary, index=False)
+    os.replace(temporary, destination)
+
+
 def main() -> int:
     faulthandler.enable(all_threads=True)
     set_stable_native_defaults()
@@ -136,12 +194,15 @@ def main() -> int:
     }
 
     base_cells = [2, 3, 5, 6, 8]
-    cbf_cells = [33, 35, 37, 39, 41, 43]
-    guided_cells = [53]
+    # Cell 43 is the DDPG-CBF training cell.  Evaluation only needs the CBF
+    # definitions and metric helper cells; executing 43 would honor its
+    # notebook default and launch a fresh training subprocess before loading
+    # the saved model.
+    cbf_cells = [33, 35, 37, 39, 41]
     needs_cbf = args.variant in {"ddpg-cbf", "guided-ddpg-cbf"}
     exec_notebook_cells(
         notebook_path,
-        base_cells + (cbf_cells if needs_cbf else []) + (guided_cells if args.variant == "guided-ddpg-cbf" else []),
+        base_cells + (cbf_cells if needs_cbf else []),
         namespace,
         args,
     )
@@ -149,12 +210,90 @@ def main() -> int:
 
     namespace["DEVICE"] = args.device
     namespace["ENV_CONFIG"] = env_config_from_args(args, namespace["ENV_CONFIG"])
+    if args.variant == "guided-ddpg-cbf":
+        install_minimal_guided_cbf(namespace)
     traffic_model = active_traffic_model(namespace["ENV_CONFIG"])
     output_path = args.output
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    training_run = None
+    model_path = Path(args.model_path) if args.model_path is not None else default_model_path(namespace, args, traffic_model)
+
+    if args.use_latest_training:
+        if args.model_path is not None:
+            raise ValueError("--model-path cannot be combined with --use-latest-training")
+        training_run = latest_completed_training(Path(namespace["ARTIFACT_DIR"]), args.variant)
+        if training_run is None:
+            raise RuntimeError(
+                f"No completed archived training run is registered for {args.variant!r}. "
+                "Train through the notebook task runner first, or evaluate an explicit --model-path without cache mode."
+            )
+        model_path = training_run.model_path
+        print(
+            f"[eval-runner] latest saved training: {training_run.label} | "
+            f"run={training_run.run_dir.name} | model={model_path}",
+            flush=True,
+        )
+
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Saved model does not exist: {model_path}")
+
+    cache_metrics_path: Path | None = None
+    cache_manifest_path: Path | None = None
+    evaluation_request: dict[str, Any] | None = None
+    evaluation_fingerprint: str | None = None
+    if args.use_latest_training:
+        cbf_config = (
+            {
+                "lambda_filter": float(namespace["CBF_FILTER_REWARD_LAMBDA"]),
+                "k0": float(namespace["CBF_K0"]),
+                "k1": float(namespace["CBF_K1"]),
+                "eps_side": float(namespace["CBF_EPS_SIDE"]),
+            }
+            if needs_cbf
+            else {}
+        )
+        evaluation_request = build_evaluation_request(
+            variant=args.variant,
+            model_path=model_path,
+            training_run=training_run,
+            episodes=args.episodes,
+            seed=args.seed,
+            device=args.device,
+            traffic_model=traffic_model,
+            env_config=namespace["ENV_CONFIG"],
+            cbf_config=cbf_config,
+            evaluator_code_sha256=sha256_file(Path(__file__).resolve()),
+            notebook_code_sha256=notebook_code_sha256(notebook_path),
+        )
+        evaluation_fingerprint = stable_json_digest(evaluation_request)
+        cache_metrics_path, cache_manifest_path = evaluation_cache_paths(
+            artifact_dir=Path(namespace["ARTIFACT_DIR"]),
+            model_path=model_path,
+            training_run=training_run,
+            evaluation_fingerprint=evaluation_fingerprint,
+        )
+        cached = None if args.force_reevaluate else load_matching_evaluation(
+            metrics_path=cache_metrics_path,
+            manifest_path=cache_manifest_path,
+            evaluation_fingerprint=evaluation_fingerprint,
+            model_sha256=str(evaluation_request["model_sha256"]),
+        )
+        if cached is not None:
+            sync_metrics_to_requested_output(cache_metrics_path, output_path)
+            metrics = pd.read_csv(cache_metrics_path)
+            print(
+                f"[eval-runner] matching evaluation cache hit for model {evaluation_request['model_sha256'][:12]}; "
+                f"reused {cache_metrics_path}",
+                flush=True,
+            )
+            print(f"[eval-runner] refreshed {output_path}", flush=True)
+            print(metrics.drop(columns=["episode"], errors="ignore").mean().to_frame("mean"), flush=True)
+            return 0
+        print(
+            "[eval-runner] no matching evaluation manifest; evaluating the latest saved training now",
+            flush=True,
+        )
 
     if args.variant == "ppo":
-        model_path = args.model_path or artifact_path(namespace["MODEL_PATH"], traffic_model, args.artifact_suffix)
         print(f"[eval-runner] loading {model_path}", flush=True)
         model = namespace["PPO"].load(str(model_path), device=args.device)
         print("[eval-runner] evaluating PPO", flush=True)
@@ -166,7 +305,6 @@ def main() -> int:
             env_config=namespace["ENV_CONFIG"],
         )
     elif args.variant == "ddpg":
-        model_path = args.model_path or artifact_path(namespace["DDPG_MODEL_PATH"], traffic_model, args.artifact_suffix)
         print(f"[eval-runner] loading {model_path}", flush=True)
         model = namespace["DDPG"].load(str(model_path), device=args.device)
         print("[eval-runner] evaluating DDPG", flush=True)
@@ -178,7 +316,6 @@ def main() -> int:
             env_config=namespace["ENV_CONFIG"],
         )
     elif args.variant == "ddpg-cbf":
-        model_path = args.model_path or artifact_path(namespace["DDPG_CBF_MODEL_PATH"], traffic_model, args.artifact_suffix)
         print(f"[eval-runner] loading {model_path}", flush=True)
         model = namespace["DDPG"].load(str(model_path), device=args.device)
         print("[eval-runner] evaluating DDPG-CBF", flush=True)
@@ -192,7 +329,6 @@ def main() -> int:
             env_config=namespace["ENV_CONFIG"],
         )
     else:
-        model_path = args.model_path or artifact_path(namespace["GUIDED_DDPG_CBF_MODEL_PATH"], traffic_model, args.artifact_suffix)
         print(f"[eval-runner] loading {model_path}", flush=True)
         model = namespace["GuidedCBFDDPG"].load(str(model_path), device=args.device)
         print("[eval-runner] evaluating guided DDPG-CBF", flush=True)
@@ -206,7 +342,18 @@ def main() -> int:
             env_config=namespace["ENV_CONFIG"],
         )
 
-    metrics.to_csv(output_path, index=False)
+    if cache_metrics_path is not None and cache_manifest_path is not None:
+        atomic_write_metrics(metrics, cache_metrics_path)
+        write_evaluation_manifest(
+            manifest_path=cache_manifest_path,
+            metrics_path=cache_metrics_path,
+            request=evaluation_request or {},
+            evaluation_fingerprint=evaluation_fingerprint or "",
+        )
+        sync_metrics_to_requested_output(cache_metrics_path, output_path)
+        print(f"[eval-runner] cached evaluation at {cache_metrics_path}", flush=True)
+    else:
+        atomic_write_metrics(metrics, output_path)
     print(f"[eval-runner] wrote {output_path}", flush=True)
     print(metrics.drop(columns=["episode"]).mean().to_frame("mean"), flush=True)
     return 0

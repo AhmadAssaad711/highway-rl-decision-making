@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render laneless Karalakou policies out of the notebook kernel.")
     parser.add_argument("--variant", choices=["ppo", "ddpg", "ddpg-cbf", "guided-ddpg-cbf"], required=True)
     parser.add_argument("--steps", type=int, default=1_000)
-    parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--project-root", type=Path, default=None)
@@ -106,15 +106,18 @@ def main() -> int:
     args = parse_args()
 
     project_root = find_project_root(args.project_root or Path.cwd())
+    # The notebook bootstrap derives PROJECT_ROOT from the process working
+    # directory.  Run it from the resolved inner project so that it imports
+    # and registers the local ``lane-free-v0`` environment.
+    os.chdir(project_root)
     notebook_path = project_root / "notebooks" / "lanelessKaralakou.ipynb"
     namespace: dict[str, Any] = {"__name__": "__main__"}
     base_cells = [2, 3, 5, 6, 8]
-    cbf_cells = [33, 35, 37, 39, 41, 43]
-    guided_cells = [53]
+    cbf_cells = [33, 35, 37, 39, 41]
     needs_cbf = args.variant in {"ddpg-cbf", "guided-ddpg-cbf"}
     exec_notebook_cells(
         notebook_path,
-        base_cells + (cbf_cells if needs_cbf else []) + (guided_cells if args.variant == "guided-ddpg-cbf" else []),
+        base_cells + (cbf_cells if needs_cbf else []),
         namespace,
     )
     namespace["DEVICE"] = args.device

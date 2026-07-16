@@ -175,7 +175,7 @@ def collect_diagnostic_batch(
             raw_feasible = bool(
                 info.get(
                     "cbf_raw_feasible",
-                    max_constraint_violation_rl <= float(namespace.get("CBF_QP_FEASIBILITY_TOL", 1e-6)),
+                    max_constraint_violation_rl <= float(namespace.get("CBF_QP_FEASIBILITY_TOL", 1e-3)),
                 )
             )
 

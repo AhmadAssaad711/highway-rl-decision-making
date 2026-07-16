@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,21 @@ def find_project_root(start: Path) -> Path:
         if (nested / "notebooks" / "lanelessKaralakou.ipynb").exists():
             return nested
     raise RuntimeError("Could not find project root containing notebooks/lanelessKaralakou.ipynb")
+
+
+def snapshot_tensorboard_events(roots: dict[str, Path]) -> dict[str, dict[str, str]]:
+    """Return the event files below each root, keyed by resolved source path."""
+    found: dict[str, dict[str, str]] = {}
+    for kind, root in roots.items():
+        if not root.exists():
+            continue
+        for path in root.rglob("events.out.tfevents.*"):
+            if path.is_file():
+                resolved = str(path.resolve())
+                # Later roots intentionally win when the custom root happens
+                # to be nested below the standard TensorBoard directory.
+                found[resolved] = {"kind": kind, "path": resolved}
+    return found
 
 
 def exec_notebook_cell(notebook: dict[str, Any], notebook_path: Path, cell_index: int, namespace: dict[str, Any]) -> None:
@@ -142,7 +158,7 @@ def apply_traffic_artifact_suffix(namespace: dict[str, Any], artifact_suffix: st
         "GUIDED_DDPG_CBF_MODEL_PATH",
         "GUIDED_DDPG_CBF_HISTORY_PATH",
     ]:
-        if key in namespace:
+        if key in namespace and namespace[key] is not None:
             namespace[key] = _with_stem_suffix(Path(namespace[key]), suffix)
 
 
@@ -160,13 +176,13 @@ TASKS = {
         "timesteps_key": "DDPG_TOTAL_TIMESTEPS",
     },
     "ddpg-cbf-train": {
-        "deps": [2, 3, 5, 6, 8, 31, 33, 35, 37, 41],
+        "deps": [2, 3, 5, 6, 8, 9, 31, 33, 35, 37, 39, 41],
         "cell": 43,
         "flag": "RUN_DDPG_CBF_TRAIN",
         "timesteps_key": "DDPG_CBF_TOTAL_TIMESTEPS",
     },
     "guided-ddpg-cbf-train": {
-        "deps": [2, 3, 5, 6, 8, 31, 33, 35, 37, 41],
+        "deps": [2, 3, 5, 6, 8, 9, 31, 33, 35, 37, 39, 41],
         "cell": 51,
         "flag": "RUN_GUIDED_DDPG_CBF_TRAIN",
         "timesteps_key": "GUIDED_DDPG_CBF_TOTAL_TIMESTEPS",
@@ -201,9 +217,16 @@ def main() -> int:
         args.run_tag = make_run_tag()
 
     project_root = find_project_root(args.project_root or Path.cwd())
+    # Notebook bootstrap derives PROJECT_ROOT from the process working
+    # directory.  Use the resolved inner project so the local lane-free
+    # environment is imported and registered before task cells run.
+    os.chdir(project_root)
     notebook_path = project_root / "notebooks" / "lanelessKaralakou.ipynb"
     task = TASKS[args.task]
-    namespace: dict[str, Any] = {"__name__": "__main__"}
+    # Notebook cells use IPython's display() for their final summaries.  A
+    # plain subprocess has no injected display helper, so print the same value
+    # instead of failing after a successful training/save.
+    namespace: dict[str, Any] = {"__name__": "__main__", "display": print}
 
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     for cell_index in task["deps"]:
@@ -212,6 +235,29 @@ def main() -> int:
             apply_overrides(namespace, args, task)
     apply_overrides(namespace, args, task)
     apply_traffic_artifact_suffix(namespace, args.artifact_suffix)
+
+    # TensorBoard appends a long generated event filename.  On deeply nested
+    # Windows workspaces, the notebook's custom_metrics/run-name hierarchy can
+    # exceed MAX_PATH even though the directory itself can be created.
+    custom_tb_root = namespace.get("TENSORBOARD_CUSTOM_ROOT")
+    if os.name == "nt" and custom_tb_root is not None:
+        representative_event = Path(custom_tb_root) / ("x" * 32) / ("events.out.tfevents." + "x" * 48)
+        if len(str(representative_event)) >= 260:
+            # The OneDrive workspace itself is already deep enough that even
+            # the shortened artifact path can exceed Windows MAX_PATH once
+            # TensorBoard appends its generated event filename.  Keep the
+            # custom bridge logs local and short; SB3's normal TensorBoard
+            # logs and all training artifacts remain under ARTIFACT_DIR.
+            custom_tb_root = Path(tempfile.gettempdir()) / "laneless_tb"
+            custom_tb_root.mkdir(parents=True, exist_ok=True)
+            namespace["TENSORBOARD_CUSTOM_ROOT"] = custom_tb_root
+            print(f"[notebook-task] shortened custom TensorBoard root to {custom_tb_root}", flush=True)
+
+    tensorboard_roots = {
+        "standard": Path(namespace["ARTIFACT_DIR"]) / "tensorboard",
+        "custom": Path(namespace.get("TENSORBOARD_CUSTOM_ROOT", Path(namespace["ARTIFACT_DIR"]) / "tensorboard_custom")),
+    }
+    tensorboard_before = snapshot_tensorboard_events(tensorboard_roots)
 
     print(
         "[notebook-task] starting",
@@ -229,7 +275,17 @@ def main() -> int:
         },
         flush=True,
     )
+    if args.task == "ddpg-cbf-train":
+        # This process is already the isolated child requested by notebook
+        # cell 43.  Re-enter the cell's in-process branch instead of spawning
+        # another copy of this runner recursively.
+        namespace["RUN_DDPG_CBF_TRAIN_SUBPROCESS"] = False
     if args.task == "guided-ddpg-cbf-train":
+        # This runner is already the isolated training subprocess requested by
+        # notebook cell 51.  Disable that cell's optional subprocess delegate
+        # here; otherwise each child re-enters the same cell and recursively
+        # launches more guided-training children instead of training.
+        namespace["RUN_GUIDED_DDPG_CBF_TRAIN_SUBPROCESS"] = False
         install_minimal_guided_cbf(namespace)
         apply_traffic_artifact_suffix(namespace, args.artifact_suffix)
         exec_notebook_cell_tail(
@@ -247,6 +303,15 @@ def main() -> int:
         # model unrelated to the just-completed parameter screen.
         print("[notebook-task] completed ppo-train via nominal PPO pilot runner", flush=True)
         return 0
+
+    tensorboard_after = snapshot_tensorboard_events(tensorboard_roots)
+    namespace["PAPER_TENSORBOARD_EVENT_FILES"] = [
+        entry for path, entry in tensorboard_after.items() if path not in tensorboard_before
+    ]
+    print(
+        f"[notebook-task] captured {len(namespace['PAPER_TENSORBOARD_EVENT_FILES'])} new TensorBoard event file(s)",
+        flush=True,
+    )
 
     archived = archive_training_outputs(
         namespace=namespace,

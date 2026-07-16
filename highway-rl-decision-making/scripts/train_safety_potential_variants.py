@@ -51,7 +51,7 @@ VARIANTS = [
     {
         "variant": "ddpg",
         "video_variant": "ddpg",
-        "label": "DDPG",
+        "label": "DDPG (CBF safety reward)",
         "env_kind": "baseline",
         "model_class": DDPG,
         "lambda_bc": 0.0,
@@ -575,14 +575,16 @@ def make_baseline_reward_config(
     progress_clip: float,
     eps_side: float,
 ) -> dict[str, float]:
-    config = dict(namespace["REWARD_CONFIG"])
+    # Keep this policy unshielded, but train it with the same CBF-clearance
+    # safety potential as the shielded variants.
+    config = make_reward_config(namespace, SAFETY_REWARD_TRIAL)
     config.update(
         {
             "progress_reward_weight": float(progress_reward_weight),
             "progress_clip": float(progress_clip),
-            "use_current_potential": 1.0,
-            "use_safety_potential": 0.0,
-            "w_safe": 0.0,
+            "wf": 0.0,
+            "use_current_potential": 0.0,
+            "use_safety_potential": 1.0,
             "safety_potential_eps_side": float(eps_side),
         }
     )
